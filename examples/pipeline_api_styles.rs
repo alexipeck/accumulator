@@ -1,4 +1,4 @@
-use piper::{PiperConfig, Stage, StageContext, anchor, inline_stage, pipeline, stage};
+use piper::{PiperConfig, Node, NodeContext, anchor, inline_node, pipeline, node};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use thiserror::Error;
@@ -10,7 +10,7 @@ enum ExampleError {}
 
 struct AddOne;
 
-impl Stage for AddOne {
+impl Node for AddOne {
     type Input = u32;
     type Output = u32;
     type Error = ExampleError;
@@ -24,7 +24,7 @@ impl Stage for AddOne {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input + 1);
         Ok(())
@@ -33,7 +33,7 @@ impl Stage for AddOne {
 
 struct Square;
 
-impl Stage for Square {
+impl Node for Square {
     type Input = u32;
     type Output = u32;
     type Error = ExampleError;
@@ -47,7 +47,7 @@ impl Stage for Square {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input * input);
         Ok(())
@@ -56,7 +56,7 @@ impl Stage for Square {
 
 struct FormatValue;
 
-impl Stage for FormatValue {
+impl Node for FormatValue {
     type Input = u32;
     type Output = String;
     type Error = ExampleError;
@@ -70,7 +70,7 @@ impl Stage for FormatValue {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(format!("value={input}"));
         Ok(())
@@ -93,21 +93,21 @@ pipeline! {
         type Error = ExampleError;
 
         config = config();
-        stages = [AddOne, anchor(Square).max_threads(1), FormatValue];
+        nodes = [AddOne, anchor(Square).max_threads(1), FormatValue];
     }
 }
 
 pipeline! {
-    pub struct NamedStagePipeline {
+    pub struct NamedNodePipeline {
         type Input = u32;
         type Output = String;
         type Error = ExampleError;
 
         config = config();
-        stages = [
-            stage("add", AddOne),
-            anchor(stage("square", Square)).max_threads(1),
-            stage("format", FormatValue),
+        nodes = [
+            node("add", AddOne),
+            anchor(node("square", Square)).max_threads(1),
+            node("format", FormatValue),
         ];
     }
 }
@@ -119,27 +119,27 @@ pipeline! {
         type Error = ExampleError;
 
         config = config();
-        stages = [
-            inline_stage(
+        nodes = [
+            inline_node(
                 "add",
                 || -> std::result::Result<(), ExampleError> { Ok(()) },
-                |_state: &mut (), input: u32, ctx: &mut StageContext<u32, ExampleError>| {
+                |_state: &mut (), input: u32, ctx: &mut NodeContext<u32, ExampleError>| {
                     ctx.emit(input + 1);
                     Ok(())
                 },
             ),
-            anchor(inline_stage(
+            anchor(inline_node(
                 "square",
                 || -> std::result::Result<(), ExampleError> { Ok(()) },
-                |_state: &mut (), input: u32, ctx: &mut StageContext<u32, ExampleError>| {
+                |_state: &mut (), input: u32, ctx: &mut NodeContext<u32, ExampleError>| {
                     ctx.emit(input * input);
                     Ok(())
                 },
             )).max_threads(1),
-            inline_stage(
+            inline_node(
                 "format",
                 || -> std::result::Result<(), ExampleError> { Ok(()) },
-                |_state: &mut (), input: u32, ctx: &mut StageContext<String, ExampleError>| {
+                |_state: &mut (), input: u32, ctx: &mut NodeContext<String, ExampleError>| {
                     ctx.emit(format!("value={input}"));
                     Ok(())
                 },
@@ -175,7 +175,7 @@ fn run_pipeline(
 
 fn main() -> piper::Result<(), ExampleError> {
     run_pipeline("direct structs", DirectStructPipeline::start()?)?;
-    run_pipeline("stage helper", NamedStagePipeline::start()?)?;
+    run_pipeline("node helper", NamedNodePipeline::start()?)?;
     run_pipeline("inline builder", InlineBuilderPipeline::start()?)?;
     println!(
         "inline cleanup calls: {}",

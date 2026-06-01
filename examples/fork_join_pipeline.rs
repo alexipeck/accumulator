@@ -1,6 +1,6 @@
 use piper::{
-    BufferLease, PiperConfig, Stage, StageContext, StageExt, TelemetryLogConfig, anchor, pipeline,
-    stage,
+    BufferLease, Node, NodeContext, NodeExt, PiperConfig, TelemetryLogConfig, anchor, node,
+    pipeline,
 };
 use std::sync::{
     Arc,
@@ -27,7 +27,7 @@ enum ExampleError {}
 
 struct Prepare;
 
-impl Stage for Prepare {
+impl Node for Prepare {
     type Input = Batch;
     type Output = BatchLease;
     type Error = ExampleError;
@@ -41,7 +41,7 @@ impl Stage for Prepare {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         let mut output = ctx.acquire_output();
         output.extend(
@@ -56,7 +56,7 @@ impl Stage for Prepare {
 
 struct HeavyHash;
 
-impl Stage for HeavyHash {
+impl Node for HeavyHash {
     type Input = BatchLease;
     type Output = BatchLease;
     type Error = ExampleError;
@@ -70,7 +70,7 @@ impl Stage for HeavyHash {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         HEAVY_BATCHES.fetch_add(1, Ordering::Relaxed);
         let mut output = ctx.acquire_output();
@@ -82,7 +82,7 @@ impl Stage for HeavyHash {
 
 struct FixedHash;
 
-impl Stage for FixedHash {
+impl Node for FixedHash {
     type Input = BatchLease;
     type Output = BatchLease;
     type Error = ExampleError;
@@ -96,7 +96,7 @@ impl Stage for FixedHash {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         FIXED_BATCHES.fetch_add(1, Ordering::Relaxed);
         let mut output = ctx.acquire_output();
@@ -108,7 +108,7 @@ impl Stage for FixedHash {
 
 struct Normalize;
 
-impl Stage for Normalize {
+impl Node for Normalize {
     type Input = BatchLease;
     type Output = BatchLease;
     type Error = ExampleError;
@@ -122,7 +122,7 @@ impl Stage for Normalize {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input);
         Ok(())
@@ -136,7 +136,7 @@ pipeline! {
         type Error = ExampleError;
 
         config = config();
-        stages = {
+        nodes = {
             prepare = Prepare.with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
             heavy_hash = anchor(HeavyHash)
                 .max_threads(max_parallelism())
@@ -144,7 +144,7 @@ pipeline! {
             fixed_hash = anchor(FixedHash)
                 .fixed_threads(2)
                 .with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
-            normalize = stage("normalize", Normalize),
+            normalize = node("normalize", Normalize),
         };
         graph = {
             input -> prepare;

@@ -1,7 +1,7 @@
 use piper::{
-    IntoStageSpec, PipelineGraph, PipelineGraphBuilder, Piper, PiperConfig, PiperError,
-    SingleThreadWeightedBranchConfig, Stage, StageContext, TelemetryLogConfig, anchor,
-    inline_stage, pipeline, stage,
+    IntoNodeSpec, NodeThreadPolicyKind, PipelineGraph, PipelineGraphBuilder, Piper, PiperConfig,
+    NodeScalePolicy, PiperError, SingleThreadWeightedBranchConfig, Node, NodeContext,
+    TelemetryLogConfig, anchor, inline_node, node, pipeline,
 };
 use std::fs;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ fn config() -> PiperConfig {
 
 struct Double;
 
-impl Stage for Double {
+impl Node for Double {
     type Input = u32;
     type Output = u32;
     type Error = TestError;
@@ -40,7 +40,7 @@ impl Stage for Double {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input * 2);
         Ok(())
@@ -49,7 +49,7 @@ impl Stage for Double {
 
 struct FormatValue;
 
-impl Stage for FormatValue {
+impl Node for FormatValue {
     type Input = u32;
     type Output = String;
     type Error = TestError;
@@ -63,7 +63,7 @@ impl Stage for FormatValue {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(format!("value={input}"));
         Ok(())
@@ -72,7 +72,7 @@ impl Stage for FormatValue {
 
 struct Pass;
 
-impl Stage for Pass {
+impl Node for Pass {
     type Input = u32;
     type Output = u32;
     type Error = TestError;
@@ -86,7 +86,7 @@ impl Stage for Pass {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input);
         Ok(())
@@ -100,9 +100,9 @@ pipeline! {
         type Error = TestError;
 
         config = config();
-        stages = {
+        nodes = {
             external = external_node(u32, u32),
-            pass = stage("pass", Pass),
+            pass = node("pass", Pass),
         };
         graph = {
             input -> external;
@@ -116,7 +116,7 @@ struct CountPass {
     count: Arc<AtomicUsize>,
 }
 
-impl Stage for CountPass {
+impl Node for CountPass {
     type Input = u32;
     type Output = u32;
     type Error = TestError;
@@ -130,7 +130,7 @@ impl Stage for CountPass {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         self.count.fetch_add(1, Ordering::Relaxed);
         ctx.emit(input);
@@ -140,11 +140,11 @@ impl Stage for CountPass {
 
 fn one_stage_graph<S>(stage_like: S) -> PipelineGraph<u32, u32, TestError>
 where
-    S: IntoStageSpec<TestError, Input = u32, Output = u32>,
+    S: IntoNodeSpec<TestError, Input = u32, Output = u32>,
 {
     let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
     let input = builder.input();
-    let output = builder.add_stage(input, stage_like);
+    let output = builder.add_node(input, stage_like);
     builder.finish(output)
 }
 
@@ -152,8 +152,8 @@ where
 fn associated_type_stages_stream_outputs_and_default_cleanup_is_optional() {
     let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
     let input = builder.input();
-    let doubled = builder.add_stage(input, anchor(stage("double", Double)).max_threads(1));
-    let output = builder.add_stage(doubled, stage("format", FormatValue));
+    let doubled = builder.add_node(input, anchor(node("double", Double)).max_threads(1));
+    let output = builder.add_node(doubled, node("format", FormatValue));
     let piper = Piper::<u32, String, TestError>::start(config(), builder.finish(output)).unwrap();
 
     let sender = piper.sender();
@@ -178,23 +178,23 @@ fn associated_type_stages_stream_outputs_and_default_cleanup_is_optional() {
 fn get_telemetry_reports_operational_state() {
     let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
     let input = builder.input();
-    let left = builder.add_stage(input, stage("left", Pass));
-    let output = builder.add_stage(left, anchor(stage("right", Pass)).max_threads(1));
+    let left = builder.add_node(input, node("left", Pass));
+    let output = builder.add_node(left, anchor(node("right", Pass)).max_threads(1));
     let piper = Piper::<u32, u32, TestError>::start(config(), builder.finish(output)).unwrap();
 
     std::thread::sleep(Duration::from_millis(20));
     let telemetry = piper.get_telemetry();
 
     assert_eq!(telemetry.links.len(), 3);
-    assert_eq!(telemetry.stages.len(), 2);
-    assert_eq!(telemetry.stages[0].active_threads, 1);
-    assert_eq!(telemetry.stages[1].active_threads, 1);
+    assert_eq!(telemetry.nodes.len(), 2);
+    assert_eq!(telemetry.nodes[0].active_threads, 1);
+    assert_eq!(telemetry.nodes[1].active_threads, 1);
     assert_eq!(telemetry.anchors.len(), 1);
-    assert_eq!(telemetry.anchors[0].stage_index, 1);
-    assert_eq!(telemetry.anchors[0].max_threads, 1);
+    assert_eq!(telemetry.anchors[0].node_index, 1);
+    assert_eq!(telemetry.nodes[1].max_thread_count, Some(1));
     assert_eq!(telemetry.global_worker_cap, 8);
     assert_eq!(telemetry.total_active_workers, 2);
-    assert!(telemetry.stages.iter().any(|stage| stage.is_anchor));
+    assert!(telemetry.nodes.iter().any(|stage| stage.is_anchor));
     assert!(telemetry.parked_threads >= 2);
 
     piper.abort();
@@ -205,16 +205,20 @@ fn get_telemetry_reports_operational_state() {
 fn fixed_anchor_does_not_reserve_parked_worker() {
     let piper = Piper::<u32, u32, TestError>::start(
         config(),
-        one_stage_graph(anchor(stage("fixed", Pass)).fixed_threads(1)),
+        one_stage_graph(anchor(node("fixed", Pass)).fixed_threads(1)),
     )
     .unwrap();
 
     std::thread::sleep(Duration::from_millis(20));
     let telemetry = piper.get_telemetry();
 
-    assert_eq!(telemetry.stages.len(), 1);
-    assert_eq!(telemetry.stages[0].active_threads, 1);
-    assert!(telemetry.stages[0].is_fixed_anchor);
+    assert_eq!(telemetry.nodes.len(), 1);
+    assert_eq!(telemetry.nodes[0].active_threads, 1);
+    assert_eq!(
+        telemetry.nodes[0].thread_policy_kind,
+        NodeThreadPolicyKind::Fixed
+    );
+    assert!(telemetry.nodes[0].is_anchor);
     assert_eq!(telemetry.parked_threads, 0);
 
     piper.abort();
@@ -230,10 +234,10 @@ fn abort_skips_inline_builder_cleanup() {
         config(),
         one_stage_graph(
             anchor(
-                inline_stage(
+                inline_node(
                     "cleanup",
                     || -> std::result::Result<(), TestError> { Ok(()) },
-                    |_state: &mut (), input: u32, ctx: &mut StageContext<u32, TestError>| {
+                    |_state: &mut (), input: u32, ctx: &mut NodeContext<u32, TestError>| {
                         ctx.emit(input);
                         Ok(())
                     },
@@ -258,7 +262,7 @@ fn abort_skips_inline_builder_cleanup() {
 fn user_process_failure_fails_pipeline() {
     let piper = Piper::<u32, u32, TestError>::start(
         config(),
-        one_stage_graph(anchor(stage("fail", Fail)).max_threads(1)),
+        one_stage_graph(anchor(node("fail", Fail)).max_threads(1)),
     )
     .unwrap();
 
@@ -273,11 +277,11 @@ fn fork_join_graph_work_shares_and_merges_outputs() {
     let right = Arc::new(AtomicUsize::new(0));
     let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
     let input = builder.input();
-    let fork = builder.add_stage(input, stage("prepare", Pass));
+    let fork = builder.add_node(input, node("prepare", Pass));
     let merged = builder.link();
-    builder.add_stage_to(
+    builder.add_node_to(
         fork,
-        stage(
+        node(
             "left",
             CountPass {
                 count: Arc::clone(&left),
@@ -285,9 +289,9 @@ fn fork_join_graph_work_shares_and_merges_outputs() {
         ),
         merged,
     );
-    builder.add_stage_to(
+    builder.add_node_to(
         fork,
-        anchor(stage(
+        anchor(node(
             "right",
             CountPass {
                 count: Arc::clone(&right),
@@ -314,18 +318,21 @@ fn fork_join_graph_work_shares_and_merges_outputs() {
         100
     );
     assert_eq!(piper.get_telemetry().anchors.len(), 1);
-    assert_eq!(piper.get_telemetry().anchors[0].fixed_threads, Some(1));
+    assert_eq!(
+        piper.get_telemetry().nodes.iter().find(|n| n.is_anchor).unwrap().fixed_thread_count,
+        Some(1)
+    );
     piper.join().unwrap();
 }
 
 #[test]
-fn external_node_bridges_user_loop_into_managed_stage() {
+fn external_node_bridges_user_loop_into_managed_node() {
     let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
     let input = builder.input();
     let external_output = builder.link::<u32>();
     let external_token =
         builder.add_external_node_to::<u32, u32>(input, "external", external_output);
-    let output = builder.add_stage(external_output, stage("pass", Pass));
+    let output = builder.add_node(external_output, node("pass", Pass));
     let mut piper = Piper::<u32, u32, TestError>::start(config(), builder.finish(output)).unwrap();
     let external = piper.take_external_node(external_token);
 
@@ -365,6 +372,7 @@ fn external_node_failure_is_reported_from_join() {
 
     external.fail(TestError::Test);
     drop(external);
+    std::thread::sleep(Duration::from_millis(50));
     let error = piper.join().expect_err("external failure should fail join");
     assert!(matches!(
         error,
@@ -409,7 +417,7 @@ fn external_node_telemetry_uses_link_rates() {
 
     let telemetry = piper.get_telemetry();
     let external_stage = telemetry
-        .stages
+        .nodes
         .iter()
         .find(|stage| stage.name == "external")
         .unwrap();
@@ -436,15 +444,15 @@ fn external_node_telemetry_uses_link_rates() {
 #[test]
 fn piper_allows_zero_or_multiple_anchors() {
     let no_anchor =
-        Piper::<u32, u32, TestError>::start(config(), one_stage_graph(stage("pass", Pass)))
+        Piper::<u32, u32, TestError>::start(config(), one_stage_graph(node("pass", Pass)))
             .unwrap();
     no_anchor.abort();
     no_anchor.join().unwrap();
 
     let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
     let input = builder.input();
-    let left = builder.add_stage(input, anchor(stage("left", Pass)).max_threads(1));
-    let output = builder.add_stage(left, anchor(stage("right", Pass)).max_threads(1));
+    let left = builder.add_node(input, anchor(node("left", Pass)).max_threads(1));
+    let output = builder.add_node(left, anchor(node("right", Pass)).max_threads(1));
     let two_anchors =
         Piper::<u32, u32, TestError>::start(config(), builder.finish(output)).unwrap();
     assert_eq!(two_anchors.get_telemetry().anchors.len(), 2);
@@ -455,7 +463,7 @@ fn piper_allows_zero_or_multiple_anchors() {
 fn read_telemetry_log(path: &std::path::Path) -> (serde_json::Value, Vec<String>, Vec<String>) {
     let content = fs::read_to_string(path).unwrap();
     let lines: Vec<&str> = content.lines().collect();
-    assert_eq!(lines[0], "# piper-telemetry-log-v1");
+    assert_eq!(lines[0], "# piper-telemetry-log-v2");
     assert!(lines[1].starts_with("# manifest "));
     let manifest: serde_json::Value =
         serde_json::from_str(lines[1].strip_prefix("# manifest ").unwrap()).unwrap();
@@ -471,11 +479,11 @@ fn read_telemetry_log(path: &std::path::Path) -> (serde_json::Value, Vec<String>
 fn fork_join_telemetry_graph() -> PipelineGraph<u32, u32, TestError> {
     let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
     let input = builder.input();
-    let fork = builder.add_stage(input, stage("prepare", Pass));
+    let fork = builder.add_node(input, node("prepare", Pass));
     let merged = builder.link();
-    builder.add_stage_to(fork, stage("left", Pass), merged);
-    builder.add_stage_to(fork, stage("right", Pass), merged);
-    let output = builder.add_stage(merged, stage("merge", Pass));
+    builder.add_node_to(fork, node("left", Pass), merged);
+    builder.add_node_to(fork, node("right", Pass), merged);
+    let output = builder.add_node(merged, node("merge", Pass));
     builder.finish(output)
 }
 
@@ -493,7 +501,7 @@ fn telemetry_log_writes_manifest_header_and_samples() {
             csv_telemetry: Some(TelemetryLogConfig::new(&path).interval(Duration::from_millis(5))),
             ..config()
         },
-        one_stage_graph(anchor(stage("pass", Pass)).max_threads(1)),
+        one_stage_graph(anchor(node("pass", Pass)).max_threads(1)),
     )
     .unwrap();
     piper.sender().send(1).unwrap();
@@ -508,10 +516,10 @@ fn telemetry_log_writes_manifest_header_and_samples() {
     piper.join().unwrap();
 
     let (manifest, header, samples) = read_telemetry_log(&path);
-    assert_eq!(manifest["format"], "piper-telemetry-log");
-    assert_eq!(manifest["version"], 1);
+    assert_eq!(manifest["format"], "piper-telemetry-log-v2");
+    assert_eq!(manifest["version"], 2);
     assert!(
-        manifest["stages"]
+        manifest["nodes"]
             .as_array()
             .unwrap()
             .iter()
@@ -534,11 +542,11 @@ fn telemetry_log_writes_manifest_header_and_samples() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|consumer| consumer.as_str() == Some("stage0"))
+            .any(|consumer| consumer.as_str() == Some("node0"))
     );
-    assert!(!header.iter().any(|column| column == "stage0_name"));
+    assert!(!header.iter().any(|column| column == "node0_name"));
     assert!(!header.iter().any(|column| column == "anchor_count"));
-    assert!(header.contains(&"stage0_service_time_ms".to_string()));
+    assert!(header.contains(&"node0_service_time_ms".to_string()));
     assert!(header.contains(&"link0_arrival_rate".to_string()));
     assert!(!samples.is_empty());
 
@@ -547,7 +555,7 @@ fn telemetry_log_writes_manifest_header_and_samples() {
             csv_telemetry: Some(TelemetryLogConfig::new(&path)),
             ..config()
         },
-        one_stage_graph(anchor(stage("pass", Pass)).max_threads(1)),
+        one_stage_graph(anchor(node("pass", Pass)).max_threads(1)),
     );
     let Err(existing) = existing else {
         panic!("existing telemetry log path should fail");
@@ -590,18 +598,18 @@ fn telemetry_log_manifest_classifies_fork_and_join_links() {
         .iter()
         .find(|link| link["kind"] == "fork")
         .expect("fork link");
-    assert_eq!(fork_link["producers"], serde_json::json!(["stage0"]));
+    assert_eq!(fork_link["producers"], serde_json::json!(["node0"]));
     assert!(
         fork_link["consumers"]
             .as_array()
             .unwrap()
-            .contains(&serde_json::json!("stage1"))
+            .contains(&serde_json::json!("node1"))
     );
     assert!(
         fork_link["consumers"]
             .as_array()
             .unwrap()
-            .contains(&serde_json::json!("stage2"))
+            .contains(&serde_json::json!("node2"))
     );
     let join_link = links
         .iter()
@@ -611,13 +619,13 @@ fn telemetry_log_manifest_classifies_fork_and_join_links() {
         join_link["producers"]
             .as_array()
             .unwrap()
-            .contains(&serde_json::json!("stage1"))
+            .contains(&serde_json::json!("node1"))
     );
     assert!(
         join_link["producers"]
             .as_array()
             .unwrap()
-            .contains(&serde_json::json!("stage2"))
+            .contains(&serde_json::json!("node2"))
     );
     assert_eq!(join_link["consumers"], serde_json::json!(["output"]));
     let _ = fs::remove_file(&path);
@@ -627,7 +635,7 @@ struct SlowCount {
     count: Arc<AtomicUsize>,
 }
 
-impl Stage for SlowCount {
+impl Node for SlowCount {
     type Input = u32;
     type Output = u32;
     type Error = TestError;
@@ -641,7 +649,7 @@ impl Stage for SlowCount {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         self.count.fetch_add(1, Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(25));
@@ -653,8 +661,8 @@ impl Stage for SlowCount {
 fn weighted_branch_graph(
     _left: Arc<AtomicUsize>,
     _right: Arc<AtomicUsize>,
-    left_stage: impl IntoStageSpec<TestError, Input = u32, Output = u32>,
-    right_stage: impl IntoStageSpec<TestError, Input = u32, Output = u32>,
+    left_stage: impl IntoNodeSpec<TestError, Input = u32, Output = u32>,
+    right_stage: impl IntoNodeSpec<TestError, Input = u32, Output = u32>,
 ) -> PipelineGraph<u32, u32, TestError> {
     let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
     let input = builder.input();
@@ -667,9 +675,9 @@ fn weighted_branch_graph(
         },
     );
     let merged = builder.link();
-    builder.add_stage_to(branch_links.left, left_stage, merged);
-    builder.add_stage_to(branch_links.right, right_stage, merged);
-    let output = builder.add_stage(merged, stage("merge", Pass));
+    builder.add_node_to(branch_links.left, left_stage, merged);
+    builder.add_node_to(branch_links.right, right_stage, merged);
+    let output = builder.add_node(merged, node("merge", Pass));
     builder.finish(output)
 }
 
@@ -682,13 +690,13 @@ fn weighted_branch_routes_each_input_exactly_once() {
         weighted_branch_graph(
             Arc::clone(&left),
             Arc::clone(&right),
-            stage(
+            node(
                 "left",
                 CountPass {
                     count: Arc::clone(&left),
                 },
             ),
-            stage(
+            node(
                 "right",
                 CountPass {
                     count: Arc::clone(&right),
@@ -701,7 +709,6 @@ fn weighted_branch_routes_each_input_exactly_once() {
     for value in 0..100 {
         piper.sender().send(value).unwrap();
     }
-    piper.shutdown();
     for _ in 0..100 {
         piper
             .receiver()
@@ -713,6 +720,7 @@ fn weighted_branch_routes_each_input_exactly_once() {
         left.load(Ordering::Relaxed) + right.load(Ordering::Relaxed),
         100
     );
+    piper.shutdown();
     piper.join().unwrap();
 }
 
@@ -728,13 +736,13 @@ fn weighted_branch_routes_more_to_faster_downstream_after_backlog() {
         weighted_branch_graph(
             Arc::clone(&left),
             Arc::clone(&right),
-            stage(
+            node(
                 "slow",
                 SlowCount {
                     count: Arc::clone(&left),
                 },
             ),
-            stage(
+            node(
                 "fast",
                 CountPass {
                     count: Arc::clone(&right),
@@ -770,13 +778,13 @@ fn weighted_branch_snapshot_reports_output_links() {
         weighted_branch_graph(
             Arc::clone(&left),
             Arc::clone(&right),
-            stage(
+            node(
                 "left",
                 CountPass {
                     count: Arc::clone(&left),
                 },
             ),
-            stage(
+            node(
                 "right",
                 CountPass {
                     count: Arc::clone(&right),
@@ -789,7 +797,7 @@ fn weighted_branch_snapshot_reports_output_links() {
     std::thread::sleep(Duration::from_millis(20));
     let telemetry = piper.get_telemetry();
     let branch = telemetry
-        .stages
+        .nodes
         .iter()
         .find(|stage| stage.name == "branch")
         .expect("branch stage");
@@ -801,7 +809,7 @@ fn weighted_branch_snapshot_reports_output_links() {
     assert!(!branch.is_external);
 
     let merge = telemetry
-        .stages
+        .nodes
         .iter()
         .find(|stage| stage.name == "merge")
         .expect("merge stage");
@@ -814,7 +822,7 @@ fn weighted_branch_snapshot_reports_output_links() {
 fn weighted_branch_telemetry_graph() -> PipelineGraph<u32, u32, TestError> {
     let left = Arc::new(AtomicUsize::new(0));
     let right = Arc::new(AtomicUsize::new(0));
-    weighted_branch_graph(left, right, stage("left", Pass), stage("right", Pass))
+    weighted_branch_graph(left, right, node("left", Pass), node("right", Pass))
 }
 
 #[test]
@@ -839,7 +847,7 @@ fn weighted_branch_telemetry_manifest_lists_both_output_links() {
     piper.join().unwrap();
 
     let (manifest, header, _) = read_telemetry_log(&path);
-    let branch = manifest["stages"]
+    let branch = manifest["nodes"]
         .as_array()
         .unwrap()
         .iter()
@@ -858,11 +866,11 @@ fn weighted_branch_telemetry_manifest_lists_both_output_links() {
             link["producers"]
                 .as_array()
                 .unwrap()
-                .contains(&serde_json::json!("stage0"))
+                .contains(&serde_json::json!("node0"))
                 && link["consumers"]
                     .as_array()
                     .unwrap()
-                    .contains(&serde_json::json!("stage1"))
+                    .contains(&serde_json::json!("node1"))
         })
         .expect("left branch output link");
     let right_link = links
@@ -871,11 +879,11 @@ fn weighted_branch_telemetry_manifest_lists_both_output_links() {
             link["producers"]
                 .as_array()
                 .unwrap()
-                .contains(&serde_json::json!("stage0"))
+                .contains(&serde_json::json!("node0"))
                 && link["consumers"]
                     .as_array()
                     .unwrap()
-                    .contains(&serde_json::json!("stage2"))
+                    .contains(&serde_json::json!("node2"))
         })
         .expect("right branch output link");
     assert_ne!(left_link["id"], right_link["id"]);
@@ -907,9 +915,9 @@ fn weighted_branch_rejects_feeder_on_output_links() {
         SingleThreadWeightedBranchConfig::default(),
     );
     let merged = builder.link();
-    builder.add_stage_to(left, stage("left", Pass), merged);
-    builder.add_stage_to(right, stage("right", Pass), merged);
-    let output = builder.add_stage(merged, stage("merge", Pass));
+    builder.add_node_to(left, node("left", Pass), merged);
+    builder.add_node_to(right, node("right", Pass), merged);
+    let output = builder.add_node(merged, node("merge", Pass));
     let graph = builder.finish(output);
 
     let Err(error) = Piper::<u32, u32, TestError>::start(config(), graph) else {
@@ -1032,7 +1040,7 @@ mod feeder_tests {
     }
 
     #[test]
-    fn feeder_external_output_before_managed_stage() {
+    fn feeder_external_output_before_managed_node() {
         let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
         let input = builder.input();
         let external_out = builder.link::<u32>();
@@ -1040,9 +1048,9 @@ mod feeder_tests {
         builder.feeder_link(external_out, feeder_config());
         let external_token =
             builder.add_external_node_to::<u32, u32>(input, "external", external_out);
-        builder.add_stage_to(
+        builder.add_node_to(
             external_out,
-            anchor(stage("pass", Pass)).fixed_threads(1),
+            anchor(node("pass", Pass)).fixed_threads(1),
             output,
         );
         let mut piper =
@@ -1123,7 +1131,7 @@ mod feeder_tests {
 
 struct Fail;
 
-impl Stage for Fail {
+impl Node for Fail {
     type Input = u32;
     type Output = u32;
     type Error = TestError;
@@ -1137,8 +1145,92 @@ impl Stage for Fail {
         &self,
         _state: &mut Self::State,
         _input: Self::Input,
-        _ctx: &mut StageContext<Self::Output, Self::Error>,
+        _ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         Err(TestError::Test)
     }
+}
+
+#[test]
+fn scalable_non_anchor_node_is_not_marked_anchor() {
+    let piper = Piper::<u32, u32, TestError>::start(
+        config(),
+        one_stage_graph(node("pass", Pass).scalable_threads(2, 4)),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let telemetry = piper.get_telemetry();
+    assert!(!telemetry.nodes[0].is_anchor);
+    assert_eq!(
+        telemetry.nodes[0].thread_policy_kind,
+        NodeThreadPolicyKind::Scalable
+    );
+    piper.abort();
+    piper.join().unwrap();
+}
+
+#[test]
+fn max_threads_without_anchor_does_not_create_anchor() {
+    let piper = Piper::<u32, u32, TestError>::start(
+        config(),
+        one_stage_graph(node("pass", Pass).max_threads(2)),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let telemetry = piper.get_telemetry();
+    assert!(!telemetry.nodes[0].is_anchor);
+    assert_eq!(telemetry.anchors.len(), 0);
+    piper.abort();
+    piper.join().unwrap();
+}
+
+#[test]
+fn anchor_without_explicit_policy_gets_default_scalable() {
+    let piper = Piper::<u32, u32, TestError>::start(
+        config(),
+        one_stage_graph(anchor(node("pass", Pass))),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let telemetry = piper.get_telemetry();
+    assert!(telemetry.nodes[0].is_anchor);
+    assert_eq!(
+        telemetry.nodes[0].thread_policy_kind,
+        NodeThreadPolicyKind::Scalable
+    );
+    assert!(telemetry.nodes[0].max_thread_count.unwrap() >= 1);
+    piper.abort();
+    piper.join().unwrap();
+}
+
+#[test]
+fn telemetry_v2_manifest_uses_nodes_and_node_columns() {
+    let path = std::env::temp_dir().join(format!(
+        "piper_v2_telemetry_{}_{}.piper.csv",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("runtime")
+    ));
+    let _ = fs::remove_file(&path);
+
+    let piper = Piper::<u32, u32, TestError>::start(
+        PiperConfig {
+            csv_telemetry: Some(TelemetryLogConfig::new(&path).interval(Duration::from_millis(5))),
+            ..config()
+        },
+        one_stage_graph(node("pass", Pass).scalable_threads(1, 2)),
+    )
+    .unwrap();
+    piper.sender().send(1).unwrap();
+    let _ = piper.receiver().recv_timeout(Duration::from_secs(1)).unwrap();
+    piper.shutdown();
+    piper.join().unwrap();
+
+    let (manifest, header, _) = read_telemetry_log(&path);
+    assert_eq!(manifest["format"], "piper-telemetry-log-v2");
+    assert_eq!(manifest["version"], 2);
+    assert!(manifest.get("nodes").is_some());
+    assert!(manifest.get("stages").is_none());
+    assert!(header.iter().any(|c| c.starts_with("node0_")));
+    assert!(!header.iter().any(|c| c.starts_with("stage0_")));
+    let _ = fs::remove_file(&path);
 }

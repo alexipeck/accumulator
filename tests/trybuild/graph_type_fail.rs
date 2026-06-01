@@ -1,4 +1,4 @@
-use piper::{PiperConfig, Stage, StageContext, pipeline, stage};
+use piper::{PiperConfig, Node, NodeContext, node, pipeline};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -7,7 +7,7 @@ enum MacroError {}
 
 struct Widen;
 
-impl Stage for Widen {
+impl Node for Widen {
     type Input = u8;
     type Output = u16;
     type Error = MacroError;
@@ -21,7 +21,7 @@ impl Stage for Widen {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input as u16);
         Ok(())
@@ -30,7 +30,7 @@ impl Stage for Widen {
 
 struct ToText;
 
-impl Stage for ToText {
+impl Node for ToText {
     type Input = u8;
     type Output = String;
     type Error = MacroError;
@@ -44,7 +44,7 @@ impl Stage for ToText {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input.to_string());
         Ok(())
@@ -53,7 +53,7 @@ impl Stage for ToText {
 
 struct Keep;
 
-impl Stage for Keep {
+impl Node for Keep {
     type Input = u16;
     type Output = u16;
     type Error = MacroError;
@@ -67,7 +67,7 @@ impl Stage for Keep {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input);
         Ok(())
@@ -90,10 +90,10 @@ pipeline! {
         type Error = MacroError;
 
         config = config();
-        stages = {
-            widen = stage("widen", Widen),
-            text = stage("text", ToText),
-            keep = stage("keep", Keep),
+        nodes = {
+            widen = node("widen", Widen),
+            text = node("text", ToText),
+            keep = node("keep", Keep),
         };
         graph = {
             input -> [widen, text];
@@ -110,9 +110,9 @@ pipeline! {
         type Error = MacroError;
 
         config = config();
-        stages = {
+        nodes = {
             external = external_node(u8, String),
-            keep = stage("keep", Keep),
+            keep = node("keep", Keep),
         };
         graph = {
             input -> external;

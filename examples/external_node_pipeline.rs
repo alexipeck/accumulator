@@ -1,6 +1,6 @@
 use piper::{
-    PiperConfig, RecvOutputError, SendInputError, Stage, StageContext, TelemetryLogConfig, anchor,
-    pipeline, stage,
+    Node, NodeContext, PiperConfig, RecvOutputError, SendInputError, TelemetryLogConfig, anchor,
+    node, pipeline,
 };
 use std::sync::{
     Arc,
@@ -30,7 +30,7 @@ enum ExampleError {
 
 struct Prepare;
 
-impl Stage for Prepare {
+impl Node for Prepare {
     type Input = Batch;
     type Output = Batch;
     type Error = ExampleError;
@@ -44,7 +44,7 @@ impl Stage for Prepare {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(
             input
@@ -58,7 +58,7 @@ impl Stage for Prepare {
 
 struct ManagedHash;
 
-impl Stage for ManagedHash {
+impl Node for ManagedHash {
     type Input = Batch;
     type Output = Batch;
     type Error = ExampleError;
@@ -72,7 +72,7 @@ impl Stage for ManagedHash {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         MANAGED_BATCHES.fetch_add(1, Ordering::Relaxed);
         ctx.emit(hash_batch(&input, MANAGED_ROUNDS));
@@ -82,7 +82,7 @@ impl Stage for ManagedHash {
 
 struct Normalize;
 
-impl Stage for Normalize {
+impl Node for Normalize {
     type Input = Batch;
     type Output = Batch;
     type Error = ExampleError;
@@ -96,7 +96,7 @@ impl Stage for Normalize {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input);
         Ok(())
@@ -110,11 +110,11 @@ pipeline! {
         type Error = ExampleError;
 
         config = config();
-        stages = {
-            prepare = stage("prepare", Prepare),
+        nodes = {
+            prepare = node("prepare", Prepare),
             managed_hash = anchor(ManagedHash).max_threads(max_parallelism()),
             external_hash = external_node(Batch, Batch),
-            normalize = stage("normalize", Normalize),
+            normalize = node("normalize", Normalize),
         };
         graph = {
             input -> prepare;
@@ -251,12 +251,12 @@ fn main() -> piper::Result<(), ExampleError> {
     }
 
     let telemetry = run.get_telemetry();
-    let external_stage = telemetry
-        .stages
+    let external_node_snapshot = telemetry
+        .nodes
         .iter()
-        .find(|stage| stage.name == "external_hash");
-    let (external_input_rate, external_output_rate) = external_stage
-        .map(|stage| (stage.external_input_rate, stage.external_output_rate))
+        .find(|node| node.name == "external_hash");
+    let (external_input_rate, external_output_rate) = external_node_snapshot
+        .map(|node| (node.external_input_rate, node.external_output_rate))
         .unwrap_or_default();
 
     run.join()?;

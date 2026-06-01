@@ -1,0 +1,371 @@
+fn choose_scale_operation<E>(
+    links: &[LinkControl],
+    active_by_node: &[Vec<usize>],
+    controls: &mut [NodeControl],
+    nodes: &[RuntimeNode<E>],
+    output_link: usize,
+    global_worker_cap: usize,
+) -> Option<ScaleOperation>
+where
+    E: Debug + Display + Send + 'static,
+{
+    if let Some(operation) = choose_scalable_scale_up(
+        links,
+        active_by_node,
+        controls,
+        nodes,
+        output_link,
+        global_worker_cap,
+    ) {
+        return Some(operation);
+    }
+
+    if let Some(operation) = choose_support_operation(
+        links,
+        active_by_node,
+        controls,
+        nodes,
+        output_link,
+        global_worker_cap,
+    ) {
+        return Some(operation);
+    }
+
+    if let Some(operation) = choose_anchor_pressure_operation(
+        links,
+        active_by_node,
+        controls,
+        nodes,
+        output_link,
+        global_worker_cap,
+    ) {
+        return Some(operation);
+    }
+
+    choose_scale_down_operation(links, active_by_node, controls, nodes, output_link)
+}
+
+fn downstream_blocks_scale_up<E>(
+    links: &[LinkControl],
+    nodes: &[RuntimeNode<E>],
+    node_index: usize,
+    output_link: usize,
+) -> bool
+where
+    E: Debug + Display + Send + 'static,
+{
+    links[output_link].trend.is_growing()
+        || links[nodes[node_index].output_links[0]].trend.is_growing()
+}
+
+fn choose_scalable_scale_up<E>(
+    links: &[LinkControl],
+    active_by_node: &[Vec<usize>],
+    controls: &mut [NodeControl],
+    nodes: &[RuntimeNode<E>],
+    output_link: usize,
+    global_worker_cap: usize,
+) -> Option<ScaleOperation>
+where
+    E: Debug + Display + Send + 'static,
+{
+    if active_worker_count(active_by_node) >= global_worker_cap {
+        return None;
+    }
+
+    for node_index in 0..controls.len() {
+        let ResolvedThreadPolicy::Scalable(policy) = controls[node_index].thread_policy else {
+            continue;
+        };
+        if !node_can_scale(&controls[node_index]) {
+            continue;
+        }
+        if downstream_blocks_scale_up(links, nodes, node_index, output_link) {
+            continue;
+        }
+        let active = active_by_node[node_index].len();
+        if active >= controls[node_index].desired_workers || active >= policy.max_threads {
+            continue;
+        }
+        let input = &links[nodes[node_index].input_link];
+        if controls[node_index].backlog_seconds <= policy.target_queue_seconds
+            && !input.trend.is_growing()
+        {
+            continue;
+        }
+        return Some(ScaleOperation::Add {
+            node_index,
+            reason: ScaleReason::Scalable,
+        });
+    }
+
+    None
+}
+
+fn choose_support_operation<E>(
+    links: &[LinkControl],
+    active_by_node: &[Vec<usize>],
+    controls: &mut [NodeControl],
+    nodes: &[RuntimeNode<E>],
+    output_link: usize,
+    global_worker_cap: usize,
+) -> Option<ScaleOperation>
+where
+    E: Debug + Display + Send + 'static,
+{
+    if links[output_link].trend.is_growing() {
+        return None;
+    }
+
+    for link_index in 0..links.len() {
+        if !links[link_index].trend.is_growing() {
+            continue;
+        }
+        for consumer_index in consumer_nodes(nodes, link_index) {
+            if !matches!(
+                controls[consumer_index].thread_policy,
+                ResolvedThreadPolicy::ImplicitSupport
+            ) {
+                continue;
+            }
+            if active_by_node[consumer_index].len() < controls[consumer_index].desired_workers
+                && node_can_scale(&controls[consumer_index])
+                && !downstream_blocks_scale_up(links, nodes, consumer_index, output_link)
+            {
+                return add_or_rebalance_for_node(
+                    consumer_index,
+                    active_by_node,
+                    controls,
+                    global_worker_cap,
+                );
+            }
+        }
+    }
+
+    None
+}
+
+fn choose_anchor_pressure_operation<E>(
+    links: &[LinkControl],
+    active_by_node: &[Vec<usize>],
+    controls: &mut [NodeControl],
+    nodes: &[RuntimeNode<E>],
+    output_link: usize,
+    global_worker_cap: usize,
+) -> Option<ScaleOperation>
+where
+    E: Debug + Display + Send + 'static,
+{
+    if links[output_link].trend.is_growing() {
+        return None;
+    }
+
+    for anchor_index in anchor_node_indices(controls) {
+        let input_link = nodes[anchor_index].input_link;
+        let target_queue = match controls[anchor_index].thread_policy {
+            ResolvedThreadPolicy::Scalable(policy) => policy.target_queue_seconds,
+            _ => 1.0,
+        };
+        if controls[anchor_index].busy_ratio <= 0.60
+            || !link_underfeeds_node(
+                &links[input_link],
+                active_by_node[anchor_index].len(),
+                controls[anchor_index].backlog_seconds,
+                target_queue,
+            )
+        {
+            continue;
+        }
+
+        for producer_index in producer_nodes(nodes, input_link) {
+            if matches!(
+                controls[producer_index].thread_policy,
+                ResolvedThreadPolicy::Fixed(_)
+            ) {
+                continue;
+            }
+            if links[nodes[producer_index].input_link].trend == QueueTrend::Starved {
+                continue;
+            }
+            if !node_can_scale(&controls[producer_index])
+                || downstream_blocks_scale_up(links, nodes, producer_index, output_link)
+            {
+                continue;
+            }
+            if active_by_node[producer_index].len() < controls[producer_index].desired_workers {
+                controls[anchor_index].last_anchor_pressure_reason =
+                    Some(AnchorPressureReason::InputUnderfed);
+                return add_or_rebalance_for_node(
+                    producer_index,
+                    active_by_node,
+                    controls,
+                    global_worker_cap,
+                );
+            }
+        }
+    }
+
+    None
+}
+
+fn choose_scale_down_operation<E>(
+    links: &[LinkControl],
+    active_by_node: &[Vec<usize>],
+    controls: &mut [NodeControl],
+    nodes: &[RuntimeNode<E>],
+    output_link: usize,
+) -> Option<ScaleOperation>
+where
+    E: Debug + Display + Send + 'static,
+{
+    let now = Instant::now();
+    for node_index in 0..controls.len() {
+        if active_by_node[node_index].len() <= 1 || !node_can_scale(&controls[node_index]) {
+            continue;
+        }
+        if downstream_blocks_scale_up(links, nodes, node_index, output_link) {
+            continue;
+        }
+
+        match controls[node_index].thread_policy {
+            ResolvedThreadPolicy::Scalable(policy) => {
+                let Some(since) = controls[node_index].scale_down_eligible_since else {
+                    continue;
+                };
+                if now.duration_since(since) < policy.scale_down_after {
+                    continue;
+                }
+                if controls[node_index].backlog_seconds > policy.low_queue_seconds {
+                    continue;
+                }
+                return Some(ScaleOperation::Remove {
+                    node_index,
+                    worker_id: None,
+                    reason: ScaleReason::Scalable,
+                });
+            }
+            ResolvedThreadPolicy::ImplicitSupport => {
+                if active_by_node[node_index].len()
+                    <= controls[node_index].desired_workers.max(1)
+                {
+                    continue;
+                }
+                if links[nodes[node_index].input_link].trend.is_growing() {
+                    continue;
+                }
+                return Some(ScaleOperation::Remove {
+                    node_index,
+                    worker_id: None,
+                    reason: ScaleReason::Support,
+                });
+            }
+            ResolvedThreadPolicy::Fixed(_) => {}
+        }
+    }
+
+    None
+}
+
+fn link_underfeeds_node(
+    link: &LinkControl,
+    active_threads: usize,
+    backlog_seconds: f64,
+    target_queue_seconds: f64,
+) -> bool {
+    if backlog_seconds > target_queue_seconds {
+        return false;
+    }
+    link.trend == QueueTrend::Starved
+        || (link.trend == QueueTrend::FastDraining
+            && backlog_seconds <= target_queue_seconds
+            && link.len <= active_threads.saturating_mul(2).max(1))
+        || (link.trend.is_draining()
+            && link.trend != QueueTrend::FastDraining
+            && link.len <= active_threads.saturating_mul(2).max(1))
+}
+
+fn node_can_scale(control: &NodeControl) -> bool {
+    !control.is_external
+        && !control.is_weighted_branch
+        && !matches!(control.thread_policy, ResolvedThreadPolicy::Fixed(_))
+        && !control.settling
+        && control.scaling_state != NodeScalingState::Settling
+}
+
+fn add_or_rebalance_for_node(
+    node_index: usize,
+    active_by_node: &[Vec<usize>],
+    controls: &mut [NodeControl],
+    global_worker_cap: usize,
+) -> Option<ScaleOperation> {
+    if active_worker_count(active_by_node) < global_worker_cap {
+        return Some(ScaleOperation::Add {
+            node_index,
+            reason: ScaleReason::Support,
+        });
+    }
+
+    for anchor_index in anchor_node_indices(controls) {
+        if node_index != anchor_index
+            && matches!(
+                controls[anchor_index].thread_policy,
+                ResolvedThreadPolicy::Scalable(_)
+            )
+            && active_by_node[anchor_index].len() > 1
+            && node_can_scale(&controls[anchor_index])
+        {
+            controls[anchor_index].last_anchor_pressure_reason =
+                Some(AnchorPressureReason::BudgetPressure);
+            return Some(ScaleOperation::Remove {
+                node_index: anchor_index,
+                worker_id: None,
+                reason: ScaleReason::BudgetPressure,
+            });
+        }
+    }
+
+    None
+}
+
+fn active_worker_count(active_by_node: &[Vec<usize>]) -> usize {
+    active_by_node.iter().map(Vec::len).sum()
+}
+
+fn anchor_node_indices(controls: &[NodeControl]) -> impl Iterator<Item = usize> + '_ {
+    controls
+        .iter()
+        .enumerate()
+        .filter_map(|(index, control)| control.is_anchor.then_some(index))
+}
+
+fn consumer_nodes<E>(
+    nodes: &[RuntimeNode<E>],
+    link_index: usize,
+) -> impl Iterator<Item = usize> + '_
+where
+    E: Debug + Display + Send + 'static,
+{
+    nodes
+        .iter()
+        .enumerate()
+        .filter_map(move |(index, node)| (node.input_link == link_index).then_some(index))
+}
+
+fn producer_nodes<E>(
+    nodes: &[RuntimeNode<E>],
+    link_index: usize,
+) -> impl Iterator<Item = usize> + '_
+where
+    E: Debug + Display + Send + 'static,
+{
+    nodes.iter().enumerate().filter_map(move |(index, node)| {
+        node.output_links
+            .iter()
+            .any(|&output| output == link_index)
+            .then_some(index)
+    })
+}
+
+fn duration_nanos_u64(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}

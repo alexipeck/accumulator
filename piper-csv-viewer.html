@@ -438,7 +438,7 @@
       "#fb7185", "#38bdf8", "#fbbf24", "#4ade80", "#c084fc",
     ];
 
-    const CATEGORIES = ["Pipeline", "Links", "Stages", "Anchors", "External"];
+    const CATEGORIES = ["Pipeline", "Links", "Nodes", "Anchors", "External"];
     const PRESETS = {
       Queues: ["len", "smoothed_len", "trend"],
       Rates: ["arrival_rate", "drain_rate", "net_rate", "external_input_rate", "external_output_rate"],
@@ -482,6 +482,15 @@
 
     function pathKey(path) {
       return (path || "").trim().replace(/\\/g, "/").toLowerCase();
+    }
+
+    function computeSchemaKey(headers, manifest) {
+      const headerPart = headers.join("\n");
+      const metrics = (manifest?.metrics || [])
+        .map((m) => `${m.object_id}\t${m.metric}\t${m.column}`)
+        .sort()
+        .join("\n");
+      return headerPart + "\n---\n" + metrics;
     }
 
     function buildConfigFromState() {
@@ -539,12 +548,19 @@
     function persistToStorage() {
       if (storageApplyDepth > 0 || state.headers.length === 0) return;
       const path = (state.csvPath || csvPathInput.value || "").trim() || null;
+      const config = buildConfigFromState();
+      const schemaKey = computeSchemaKey(state.headers, state.manifest);
       try {
+        const prev = loadSavedState() || {};
+        const configsBySchema = { ...(prev.configsBySchema || {}) };
+        if (config) configsBySchema[schemaKey] = config;
         localStorage.setItem(
           STORAGE_KEY,
           JSON.stringify({
             csvPath: path,
-            config: buildConfigFromState(),
+            config,
+            schemaKey,
+            configsBySchema,
           })
         );
       } catch (_) {
@@ -649,7 +665,8 @@
     function parsePiperLog(text) {
       const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").filter((l) => l.length > 0);
       if (lines.length < 3) throw new Error("Not a Piper telemetry log");
-      if (lines[0] !== "# piper-telemetry-log-v1") throw new Error("Missing telemetry version line");
+      if (lines[0] === "# piper-telemetry-log-v1") throw new Error("Telemetry log v1 is not supported; use v2");
+      if (lines[0] !== "# piper-telemetry-log-v2") throw new Error("Missing or unsupported telemetry version line");
       if (!lines[1].startsWith("# manifest ")) throw new Error("Missing manifest line");
       const manifest = JSON.parse(lines[1].slice("# manifest ".length));
       const headers = parseCsvLine(lines[2]);
@@ -700,8 +717,8 @@
       if (objectId === "pipeline") return "Pipeline";
       const link = (state.manifest.links || []).find((entry) => entry.id === objectId);
       if (link) return link.label;
-      const stage = (state.manifest.stages || []).find((entry) => entry.id === objectId);
-      if (stage) return stage.name;
+      const node = (state.manifest.nodes || []).find((entry) => entry.id === objectId);
+      if (node) return node.name;
       const anchor = (state.manifest.anchors || []).find((entry) => entry.id === objectId);
       if (anchor) return anchor.name;
       return objectId;
@@ -1040,15 +1057,15 @@
         row.classList.toggle("focused", cb.checked);
         topologyList.appendChild(row);
       }
-      for (const stage of state.manifest?.stages || []) {
+      for (const node of state.manifest?.nodes || []) {
         const row = document.createElement("label");
         row.className = "dash-row";
-        row.dataset.objectId = stage.id;
+        row.dataset.objectId = node.id;
         const cb = document.createElement("input");
         cb.type = "checkbox";
-        cb.checked = state.focusedObjectIds.has(stage.id);
+        cb.checked = state.focusedObjectIds.has(node.id);
         const span = document.createElement("span");
-        span.textContent = `Stage: ${stage.name}`;
+        span.textContent = `Node: ${node.name}`;
         row.append(cb, span);
         row.addEventListener("click", (e) => {
           if (e.target === cb) return;
@@ -1056,8 +1073,8 @@
           cb.dispatchEvent(new Event("change"));
         });
         cb.addEventListener("change", () => {
-          if (cb.checked) state.focusedObjectIds.add(stage.id);
-          else state.focusedObjectIds.delete(stage.id);
+          if (cb.checked) state.focusedObjectIds.add(node.id);
+          else state.focusedObjectIds.delete(node.id);
           row.classList.toggle("focused", cb.checked);
           renderAll();
           scheduleStorageSave();
@@ -1138,7 +1155,29 @@
     }
 
     function loadCsvText(text, name, savedConfig) {
+      const priorConfig = state.headers.length ? buildConfigFromState() : null;
+      const priorSchemaKey = state.headers.length
+        ? computeSchemaKey(state.headers, state.manifest)
+        : null;
       const parsed = parsePiperLog(text);
+      const newSchemaKey = computeSchemaKey(parsed.headers, parsed.manifest);
+      let configToApply = null;
+      let schemaRestored = false;
+      if (savedConfig) {
+        configToApply = savedConfig;
+      } else if (priorSchemaKey === newSchemaKey && priorConfig) {
+        configToApply = priorConfig;
+        schemaRestored = true;
+      } else {
+        const stored = loadSavedState();
+        if (stored?.configsBySchema?.[newSchemaKey]) {
+          configToApply = stored.configsBySchema[newSchemaKey];
+          schemaRestored = true;
+        } else if (stored?.schemaKey === newSchemaKey && stored?.config) {
+          configToApply = stored.config;
+          schemaRestored = true;
+        }
+      }
       state.manifest = parsed.manifest;
       state.headers = parsed.headers;
       state.columnData = parsed.columnData;
@@ -1165,10 +1204,11 @@
       if (!isFullFilesystemPath(pathLabel)) {
         status += " — Enter a full path to auto-reload after page refresh.";
       }
+      if (schemaRestored) status += " — Layout restored (matching schema).";
       statusEl.textContent = status;
       enableControls(true);
       buildDashboard();
-      if (savedConfig) applySavedConfig(savedConfig);
+      if (configToApply) applySavedConfig(configToApply);
       else renderAll();
       updateFileLabel();
       persistCsvCache(text, pathLabel);

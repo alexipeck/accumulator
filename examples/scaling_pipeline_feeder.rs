@@ -1,6 +1,6 @@
 use piper::{
-    BufferLease, FeederLinkConfig, PipelineGraphBuilder, Piper, PiperConfig, Stage, StageContext,
-    StageExt, TelemetryLogConfig, anchor, stage,
+    BufferLease, FeederLinkConfig, Node, NodeContext, NodeExt, PipelineGraphBuilder, Piper,
+    PiperConfig, TelemetryLogConfig, anchor, node,
 };
 use std::io::{self, Write};
 use std::sync::{
@@ -31,7 +31,7 @@ enum ExampleError {}
 
 struct Prepare;
 
-impl Stage for Prepare {
+impl Node for Prepare {
     type Input = Batch;
     type Output = BatchLease;
     type Error = ExampleError;
@@ -45,7 +45,7 @@ impl Stage for Prepare {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         let mut output = ctx.acquire_output();
         output.extend(
@@ -60,7 +60,7 @@ impl Stage for Prepare {
 
 struct Compute;
 
-impl Stage for Compute {
+impl Node for Compute {
     type Input = BatchLease;
     type Output = BatchLease;
     type Error = ExampleError;
@@ -74,7 +74,7 @@ impl Stage for Compute {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         COMPUTE_BATCHES.fetch_add(1, Ordering::Relaxed);
         let mut output = ctx.acquire_output();
@@ -86,7 +86,7 @@ impl Stage for Compute {
 
 struct FixedCompute;
 
-impl Stage for FixedCompute {
+impl Node for FixedCompute {
     type Input = BatchLease;
     type Output = BatchLease;
     type Error = ExampleError;
@@ -100,7 +100,7 @@ impl Stage for FixedCompute {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         FIXED_BATCHES.fetch_add(1, Ordering::Relaxed);
         let mut output = ctx.acquire_output();
@@ -112,7 +112,7 @@ impl Stage for FixedCompute {
 
 struct Emit;
 
-impl Stage for Emit {
+impl Node for Emit {
     type Input = BatchLease;
     type Output = BatchLease;
     type Error = ExampleError;
@@ -126,7 +126,7 @@ impl Stage for Emit {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input);
         Ok(())
@@ -159,11 +159,11 @@ fn build_graph() -> piper::PipelineGraph<Batch, BatchLease, ExampleError> {
     let fixed_compute = anchor(FixedCompute)
         .fixed_threads(2)
         .with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE));
-    let emit = stage("emit", Emit);
-    builder.add_stage_to(input, prepare, fork);
-    builder.add_stage_to(fork, compute, joined);
-    builder.add_stage_to(fork, fixed_compute, joined);
-    let out = builder.add_stage(joined, emit);
+    let emit = node("emit", Emit);
+    builder.add_node_to(input, prepare, fork);
+    builder.add_node_to(fork, compute, joined);
+    builder.add_node_to(fork, fixed_compute, joined);
+    let out = builder.add_node(joined, emit);
     builder.feeder_link(fork, FeederLinkConfig::default());
     builder.finish(out)
 }

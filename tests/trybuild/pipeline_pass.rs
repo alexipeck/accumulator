@@ -1,4 +1,4 @@
-use piper::{PiperConfig, Stage, StageContext, anchor, inline_stage, pipeline, stage};
+use piper::{PiperConfig, Node, NodeContext, anchor, inline_node, node, pipeline};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -7,7 +7,7 @@ enum MacroError {}
 
 struct Widen;
 
-impl Stage for Widen {
+impl Node for Widen {
     type Input = u8;
     type Output = u16;
     type Error = MacroError;
@@ -21,7 +21,7 @@ impl Stage for Widen {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input as u16);
         Ok(())
@@ -30,7 +30,7 @@ impl Stage for Widen {
 
 struct Keep;
 
-impl Stage for Keep {
+impl Node for Keep {
     type Input = u16;
     type Output = u16;
     type Error = MacroError;
@@ -44,7 +44,7 @@ impl Stage for Keep {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input);
         Ok(())
@@ -67,7 +67,7 @@ pipeline! {
         type Error = MacroError;
 
         config = config();
-        stages = [anchor(Widen).max_threads(1), Keep];
+        nodes = [anchor(Widen).max_threads(1), Keep];
     }
 }
 
@@ -78,7 +78,7 @@ pipeline! {
         type Error = MacroError;
 
         config = config();
-        stages = [anchor(stage("widen", Widen)).max_threads(1), stage("keep", Keep)];
+        nodes = [anchor(node("widen", Widen)).max_threads(1), node("keep", Keep)];
     }
 }
 
@@ -89,11 +89,11 @@ pipeline! {
         type Error = MacroError;
 
         config = config();
-        stages = [
-            anchor(inline_stage(
+        nodes = [
+            anchor(inline_node(
                 "widen",
                 || -> std::result::Result<(), MacroError> { Ok(()) },
-                |_state: &mut (), input: u8, ctx: &mut StageContext<u16, MacroError>| {
+                |_state: &mut (), input: u8, ctx: &mut NodeContext<u16, MacroError>| {
                     ctx.emit(input as u16);
                     Ok(())
                 },
@@ -109,11 +109,11 @@ pipeline! {
         type Error = MacroError;
 
         config = config();
-        stages = {
+        nodes = {
             widen = anchor(Widen).max_threads(1),
-            left = stage("left", Keep),
-            right = anchor(stage("right", Keep)).fixed_threads(1),
-            out = stage("out", Keep),
+            left = node("left", Keep),
+            right = anchor(node("right", Keep)).fixed_threads(1),
+            out = node("out", Keep),
         };
         graph = {
             input -> widen;
@@ -131,7 +131,7 @@ pipeline! {
         type Error = MacroError;
 
         config = config();
-        stages = {
+        nodes = {
             external = external_node(u8, u16),
         };
         graph = {

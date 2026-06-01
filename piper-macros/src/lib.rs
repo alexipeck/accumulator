@@ -15,21 +15,21 @@ struct PipelineInput {
     output: Type,
     error: Type,
     config: Expr,
-    stages: StageDecls,
+    nodes: NodeDecls,
     graph: Option<Vec<Edge>>,
 }
 
-enum StageDecls {
+enum NodeDecls {
     Linear(Vec<Expr>),
-    Named(Vec<NamedStage>),
+    Named(Vec<NamedNode>),
 }
 
-struct NamedStage {
+struct NamedNode {
     name: Ident,
-    kind: NamedStageKind,
+    kind: NamedNodeKind,
 }
 
-enum NamedStageKind {
+enum NamedNodeKind {
     Managed(Expr),
     External { input: Type, output: Type },
 }
@@ -50,7 +50,7 @@ struct ExternalNodeDecl {
 enum Endpoint {
     Input,
     Output,
-    Stage(Ident),
+    Node(Ident),
 }
 
 struct EndpointList {
@@ -68,7 +68,7 @@ impl Parse for Endpoint {
         match ident.to_string().as_str() {
             "input" => Ok(Endpoint::Input),
             "output" => Ok(Endpoint::Output),
-            _ => Ok(Endpoint::Stage(ident)),
+            _ => Ok(Endpoint::Node(ident)),
         }
     }
 }
@@ -99,7 +99,7 @@ impl Parse for Edge {
     }
 }
 
-impl Parse for NamedStage {
+impl Parse for NamedNode {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let name = input.parse()?;
         input.parse::<Token![=]>()?;
@@ -116,9 +116,9 @@ impl Parse for NamedStage {
                 if !content.is_empty() {
                     return Err(content.error("expected exactly two external node types"));
                 }
-                return Ok(NamedStage {
+                return Ok(NamedNode {
                     name,
-                    kind: NamedStageKind::External {
+                    kind: NamedNodeKind::External {
                         input: input_type,
                         output: output_type,
                     },
@@ -126,9 +126,9 @@ impl Parse for NamedStage {
             }
         }
         let expr = input.parse()?;
-        Ok(NamedStage {
+        Ok(NamedNode {
             name,
-            kind: NamedStageKind::Managed(expr),
+            kind: NamedNodeKind::Managed(expr),
         })
     }
 }
@@ -146,7 +146,7 @@ impl Parse for PipelineInput {
         let mut output = None;
         let mut error = None;
         let mut config = None;
-        let mut stages = None;
+        let mut nodes = None;
         let mut graph = None;
 
         while !content.is_empty() {
@@ -179,19 +179,19 @@ impl Parse for PipelineInput {
                     config = Some(content.parse()?);
                     content.parse::<Token![;]>()?;
                 }
-                "stages" => {
+                "nodes" => {
                     if content.peek(syn::token::Bracket) {
-                        let stage_content;
-                        bracketed!(stage_content in content);
+                        let node_content;
+                        bracketed!(node_content in content);
                         let parsed =
-                            Punctuated::<Expr, Token![,]>::parse_terminated(&stage_content)?;
-                        stages = Some(StageDecls::Linear(parsed.into_iter().collect()));
+                            Punctuated::<Expr, Token![,]>::parse_terminated(&node_content)?;
+                        nodes = Some(NodeDecls::Linear(parsed.into_iter().collect()));
                     } else {
-                        let stage_content;
-                        braced!(stage_content in content);
+                        let node_content;
+                        braced!(node_content in content);
                         let parsed =
-                            Punctuated::<NamedStage, Token![,]>::parse_terminated(&stage_content)?;
-                        stages = Some(StageDecls::Named(parsed.into_iter().collect()));
+                            Punctuated::<NamedNode, Token![,]>::parse_terminated(&node_content)?;
+                        nodes = Some(NodeDecls::Named(parsed.into_iter().collect()));
                     }
                     content.parse::<Token![;]>()?;
                 }
@@ -212,7 +212,7 @@ impl Parse for PipelineInput {
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
-                        "expected config, stages, or graph assignment",
+                        "expected config, nodes, or graph assignment",
                     ));
                 }
             }
@@ -229,8 +229,8 @@ impl Parse for PipelineInput {
                 .ok_or_else(|| syn::Error::new(content.span(), "missing `type Error = ...;`"))?,
             config: config
                 .ok_or_else(|| syn::Error::new(content.span(), "missing `config = ...;`"))?,
-            stages: stages
-                .ok_or_else(|| syn::Error::new(content.span(), "missing `stages = ...;`"))?,
+            nodes: nodes
+                .ok_or_else(|| syn::Error::new(content.span(), "missing `nodes = ...;`"))?,
             graph,
         })
     }
@@ -245,28 +245,28 @@ pub fn pipeline(input: TokenStream) -> TokenStream {
         output,
         error,
         config,
-        stages,
+        nodes,
         graph,
     } = parse_macro_input!(input as PipelineInput);
 
-    let expansion = match (stages, graph) {
-        (StageDecls::Linear(stages), None) => expand_linear_graph(&input, &output, &error, stages),
-        (StageDecls::Named(stages), Some(edges)) => {
-            match expand_named_graph(&input, &output, &error, stages, edges) {
+    let expansion = match (nodes, graph) {
+        (NodeDecls::Linear(nodes), None) => expand_linear_graph(&input, &output, &error, nodes),
+        (NodeDecls::Named(nodes), Some(edges)) => {
+            match expand_named_graph(&input, &output, &error, nodes, edges) {
                 Ok(tokens) => tokens,
                 Err(error) => return error.to_compile_error().into(),
             }
         }
-        (StageDecls::Linear(_), Some(_)) => {
+        (NodeDecls::Linear(_), Some(_)) => {
             return syn::Error::new_spanned(
                 name,
-                "`graph = ...` requires named `stages = { ... };`",
+                "`graph = ...` requires named `nodes = { ... };`",
             )
             .to_compile_error()
             .into();
         }
-        (StageDecls::Named(_), None) => {
-            return syn::Error::new_spanned(name, "named stages require `graph = { ... };`")
+        (NodeDecls::Named(_), None) => {
+            return syn::Error::new_spanned(name, "named nodes require `graph = { ... };`")
                 .to_compile_error()
                 .into();
         }
@@ -368,17 +368,17 @@ fn expand_linear_graph(
     input: &Type,
     output: &Type,
     error: &Type,
-    stages: Vec<Expr>,
+    nodes: Vec<Expr>,
 ) -> GraphExpansion {
     let mut tokens = quote! {
         let mut __piper_builder = ::piper::PipelineGraphBuilder::<#input, #error>::new();
         let __piper_link_0 = __piper_builder.input();
     };
     let mut previous = format_ident!("__piper_link_0");
-    for (index, stage) in stages.into_iter().enumerate() {
+    for (index, node) in nodes.into_iter().enumerate() {
         let next = format_ident!("__piper_link_{}", index + 1);
         tokens.extend(quote! {
-            let #next = __piper_builder.add_stage(#previous, #stage);
+            let #next = __piper_builder.add_node(#previous, #node);
         });
         previous = next;
     }
@@ -395,10 +395,10 @@ fn expand_named_graph(
     input: &Type,
     output: &Type,
     error: &Type,
-    stages: Vec<NamedStage>,
+    nodes: Vec<NamedNode>,
     edges: Vec<Edge>,
 ) -> Result<GraphExpansion> {
-    let declared: HashSet<String> = stages.iter().map(|stage| stage.name.to_string()).collect();
+    let declared: HashSet<String> = nodes.iter().map(|node| node.name.to_string()).collect();
     let mut parent = HashMap::<String, String>::new();
     let mut used_inputs = HashSet::<String>::new();
     let mut used_outputs = HashSet::<String>::new();
@@ -406,9 +406,9 @@ fn expand_named_graph(
 
     insert_key(&mut parent, "input:out");
     insert_key(&mut parent, "output:in");
-    for stage in &stages {
-        insert_key(&mut parent, &format!("{}:in", stage.name));
-        insert_key(&mut parent, &format!("{}:out", stage.name));
+    for node in &nodes {
+        insert_key(&mut parent, &format!("{}:in", node.name));
+        insert_key(&mut parent, &format!("{}:out", node.name));
     }
 
     for edge in &edges {
@@ -421,11 +421,11 @@ fn expand_named_graph(
                 let to_key = dest_key(to)?;
                 used_inputs.insert(to_key.clone());
                 union(&mut parent, &from_key, &to_key);
-                if let (Endpoint::Stage(from_stage), Endpoint::Stage(to_stage)) = (from, to) {
+                if let (Endpoint::Node(from_node), Endpoint::Node(to_node)) = (from, to) {
                     adjacency
-                        .entry(from_stage.to_string())
+                        .entry(from_node.to_string())
                         .or_default()
-                        .push(to_stage.to_string());
+                        .push(to_node.to_string());
                 }
             }
         }
@@ -433,33 +433,33 @@ fn expand_named_graph(
 
     if !used_outputs.contains("input:out") {
         return Err(syn::Error::new_spanned(
-            &stages[0].name,
-            "graph must connect `input` to at least one stage",
+            &nodes[0].name,
+            "graph must connect `input` to at least one node",
         ));
     }
     if !used_inputs.contains("output:in") {
         return Err(syn::Error::new_spanned(
-            &stages[0].name,
-            "graph must connect at least one stage to `output`",
+            &nodes[0].name,
+            "graph must connect at least one node to `output`",
         ));
     }
-    for stage in &stages {
-        let input_key = format!("{}:in", stage.name);
-        let output_key = format!("{}:out", stage.name);
+    for node in &nodes {
+        let input_key = format!("{}:in", node.name);
+        let output_key = format!("{}:out", node.name);
         if !used_inputs.contains(&input_key) {
             return Err(syn::Error::new_spanned(
-                &stage.name,
-                "stage is missing an input graph edge",
+                &node.name,
+                "node is missing an input graph edge",
             ));
         }
         if !used_outputs.contains(&output_key) {
             return Err(syn::Error::new_spanned(
-                &stage.name,
-                "stage is missing an output graph edge",
+                &node.name,
+                "node is missing an output graph edge",
             ));
         }
     }
-    detect_cycles(&stages, &adjacency)?;
+    detect_cycles(&nodes, &adjacency)?;
 
     let mut root_to_ident = BTreeMap::<String, Ident>::new();
     let mut roots = BTreeSet::new();
@@ -489,28 +489,28 @@ fn expand_named_graph(
         }
     }
 
-    let mut stage_decls = quote! {};
+    let mut node_decls = quote! {};
     let mut external_nodes = Vec::new();
-    for stage in stages {
-        let name = stage.name;
+    for node in nodes {
+        let name = node.name;
         let in_root = find(&mut parent, &format!("{name}:in"));
         let out_root = find(&mut parent, &format!("{name}:out"));
         let in_link = root_to_ident
             .get(&in_root)
-            .expect("stage input root exists");
+            .expect("node input root exists");
         let out_link = root_to_ident
             .get(&out_root)
-            .expect("stage output root exists");
-        match stage.kind {
-            NamedStageKind::Managed(expr) => {
-                stage_decls.extend(quote! {
+            .expect("node output root exists");
+        match node.kind {
+            NamedNodeKind::Managed(expr) => {
+                node_decls.extend(quote! {
                     let #name = #expr;
-                    __piper_builder.add_stage_to(#in_link, #name, #out_link);
+                    __piper_builder.add_node_to(#in_link, #name, #out_link);
                 });
             }
-            NamedStageKind::External { input, output } => {
+            NamedNodeKind::External { input, output } => {
                 let token_ident = format_ident!("__piper_external_{name}");
-                stage_decls.extend(quote! {
+                node_decls.extend(quote! {
                     let #token_ident = __piper_builder
                         .add_external_node_to::<#input, #output>(#in_link, stringify!(#name), #out_link);
                 });
@@ -528,7 +528,7 @@ fn expand_named_graph(
         build_graph: quote! {
             let mut __piper_builder = ::piper::PipelineGraphBuilder::<#input, #error>::new();
             #link_decls
-            #stage_decls
+            #node_decls
             let __piper_graph = __piper_builder.finish::<#output>(#output_link);
             let _ = #input_link;
         },
@@ -537,9 +537,9 @@ fn expand_named_graph(
 }
 
 fn validate_endpoint(endpoint: &Endpoint, declared: &HashSet<String>) -> Result<()> {
-    if let Endpoint::Stage(stage) = endpoint {
-        if !declared.contains(&stage.to_string()) {
-            return Err(syn::Error::new_spanned(stage, "unknown graph stage"));
+    if let Endpoint::Node(node) = endpoint {
+        if !declared.contains(&node.to_string()) {
+            return Err(syn::Error::new_spanned(node, "unknown graph node"));
         }
     }
     Ok(())
@@ -552,7 +552,7 @@ fn source_key(endpoint: &Endpoint) -> Result<String> {
             quote!(output),
             "`output` cannot be used as a graph edge source",
         )),
-        Endpoint::Stage(stage) => Ok(format!("{stage}:out")),
+        Endpoint::Node(node) => Ok(format!("{node}:out")),
     }
 }
 
@@ -563,7 +563,7 @@ fn dest_key(endpoint: &Endpoint) -> Result<String> {
             "`input` cannot be used as a graph edge destination",
         )),
         Endpoint::Output => Ok("output:in".to_string()),
-        Endpoint::Stage(stage) => Ok(format!("{stage}:in")),
+        Endpoint::Node(node) => Ok(format!("{node}:in")),
     }
 }
 
@@ -590,7 +590,7 @@ fn union(parent: &mut HashMap<String, String>, left: &str, right: &str) {
     }
 }
 
-fn detect_cycles(stages: &[NamedStage], adjacency: &HashMap<String, Vec<String>>) -> Result<()> {
+fn detect_cycles(nodes: &[NamedNode], adjacency: &HashMap<String, Vec<String>>) -> Result<()> {
     fn visit(
         node: &str,
         adjacency: &HashMap<String, Vec<String>>,
@@ -617,15 +617,15 @@ fn detect_cycles(stages: &[NamedStage], adjacency: &HashMap<String, Vec<String>>
 
     let mut temporary = HashSet::new();
     let mut permanent = HashSet::new();
-    for stage in stages {
+    for node in nodes {
         if visit(
-            &stage.name.to_string(),
+            &node.name.to_string(),
             adjacency,
             &mut temporary,
             &mut permanent,
         ) {
             return Err(syn::Error::new_spanned(
-                &stage.name,
+                &node.name,
                 "graph cycles are not supported",
             ));
         }

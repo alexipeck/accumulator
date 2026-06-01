@@ -35,14 +35,14 @@ pub enum PiperError<E: Debug + Display = String> {
     #[error("worker count must be greater than 0")]
     ZeroWorkers,
 
-    #[error("Piper requires at least one stage")]
-    NoStages,
+    #[error("Piper requires at least one node")]
+    NoNodes,
 
     #[error("Piper graph is invalid: {message}")]
     InvalidGraph { message: String },
 
-    #[error("anchor thread count must be greater than 0")]
-    InvalidAnchorThreads,
+    #[error("node thread count must be greater than 0")]
+    InvalidThreadCount,
 
     #[error("invalid weighted branch `{branch}` config: {message}")]
     InvalidWeightedBranchConfig { branch: String, message: String },
@@ -288,7 +288,42 @@ pub struct LinkSnapshot {
 }
 
 #[derive(Clone, Debug)]
-pub struct StageSnapshot {
+pub struct NodeScalePolicy {
+    pub initial_threads: usize,
+    pub max_threads: usize,
+    pub target_queue_seconds: f64,
+    pub low_queue_seconds: f64,
+    pub scale_down_after: Duration,
+    pub underutilized_busy_ratio: f64,
+}
+
+impl Default for NodeScalePolicy {
+    fn default() -> Self {
+        let max_threads = thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1)
+            .max(1);
+        let initial_threads = max_threads.div_ceil(2).max(1);
+        Self {
+            initial_threads,
+            max_threads,
+            target_queue_seconds: 1.0,
+            low_queue_seconds: 0.25,
+            scale_down_after: Duration::from_millis(500),
+            underutilized_busy_ratio: 0.35,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeThreadPolicyKind {
+    Fixed,
+    Scalable,
+    ImplicitSupport,
+}
+
+#[derive(Clone, Debug)]
+pub struct NodeSnapshot {
     pub index: usize,
     pub name: String,
     pub input_link: usize,
@@ -300,64 +335,45 @@ pub struct StageSnapshot {
     pub service_time: Duration,
     pub per_worker_throughput: f64,
     pub desired_workers: usize,
-    pub scaling_state: StageScalingState,
+    pub scaling_state: NodeScalingState,
     pub is_anchor: bool,
-    pub is_fixed_anchor: bool,
+    pub thread_policy_kind: NodeThreadPolicyKind,
+    pub fixed_thread_count: Option<usize>,
+    pub max_thread_count: Option<usize>,
+    pub target_queue_seconds: Option<f64>,
+    pub low_queue_seconds: Option<f64>,
+    pub backlog_seconds: f64,
     pub is_external: bool,
     pub external_input_rate: f64,
     pub external_output_rate: f64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StageScalingState {
+pub enum NodeScalingState {
     Eligible,
     Settling,
-    Probing,
     BackingOff,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AnchorProbeState {
-    WarmingUp,
-    Eligible,
-    Probing,
-    BackingOff,
-    AtMax,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AnchorProbeOutcome {
-    None,
-    Kept,
-    Reverted,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AnchorProbeReason {
-    None,
+pub enum AnchorPressureReason {
     InputUnderfed,
     OutputBackpressure,
     BudgetPressure,
-    SupportUnstable,
-    Idle,
 }
 
 #[derive(Clone, Debug)]
 pub struct AnchorSnapshot {
-    pub stage_index: usize,
-    pub stage_name: String,
+    pub node_index: usize,
+    pub node_name: String,
     pub active_threads: usize,
-    pub max_threads: usize,
-    pub fixed_threads: Option<usize>,
-    pub probe_state: AnchorProbeState,
-    pub last_probe_outcome: AnchorProbeOutcome,
-    pub last_probe_reason: AnchorProbeReason,
+    pub last_pressure_reason: Option<AnchorPressureReason>,
 }
 
 #[derive(Clone, Debug)]
 pub struct PiperSnapshot {
     pub links: Vec<LinkSnapshot>,
-    pub stages: Vec<StageSnapshot>,
+    pub nodes: Vec<NodeSnapshot>,
     pub anchors: Vec<AnchorSnapshot>,
     pub parked_threads: usize,
     pub total_active_workers: usize,
@@ -747,7 +763,7 @@ where
     }
 }
 
-pub struct StageContext<Out, E = String>
+pub struct NodeContext<Out, E = String>
 where
     Out: Send + 'static,
     E: Debug + Display + Send + 'static,
@@ -761,7 +777,7 @@ where
     _marker: PhantomData<fn(E)>,
 }
 
-impl<Out, E> StageContext<Out, E>
+impl<Out, E> NodeContext<Out, E>
 where
     Out: Send + 'static,
     E: Debug + Display + Send + 'static,
@@ -777,7 +793,7 @@ where
             {
                 self.abort.store(true, Ordering::Release);
                 let _ = self.internal_failure.send(InternalFailure::internal(
-                    "stage output channel closed unexpectedly",
+                    "node output channel closed unexpectedly",
                 ));
             }
             Err(_) => {}
@@ -786,7 +802,7 @@ where
 
     pub fn acquire_output(&self) -> Out {
         let acquire = self.output_acquire.as_ref().unwrap_or_else(|| {
-            panic!("ctx.acquire_output() was called for a stage without a reusable output factory")
+            panic!("ctx.acquire_output() was called for a node without a reusable output factory")
         });
         acquire()
     }
@@ -800,7 +816,7 @@ where
     }
 }
 
-pub trait Stage: Send + Sync + 'static {
+pub trait Node: Send + Sync + 'static {
     type Input: Send + 'static;
     type Output: Send + 'static;
     type Error: Debug + Display + Send + 'static;
@@ -812,7 +828,7 @@ pub trait Stage: Send + Sync + 'static {
         &self,
         state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error>;
 
     fn cleanup(&self, _state: Self::State) -> std::result::Result<(), Self::Error> {
@@ -820,23 +836,23 @@ pub trait Stage: Send + Sync + 'static {
     }
 }
 
-trait DynStage<E>: Send + Sync
+trait DynNode<E>: Send + Sync
 where
     E: Debug + Display + Send + 'static,
 {
-    fn init_box(&self) -> std::result::Result<Box<dyn Any + Send>, StageFailure<E>>;
+    fn init_box(&self) -> std::result::Result<Box<dyn Any + Send>, NodeFailure<E>>;
 
     fn process_box(
         &self,
         state: &mut dyn Any,
         input: Message,
-        ctx: RuntimeStageContext,
-    ) -> std::result::Result<(), StageFailure<E>>;
+        ctx: RuntimeNodeContext,
+    ) -> std::result::Result<(), NodeFailure<E>>;
 
-    fn cleanup_box(&self, state: Box<dyn Any + Send>) -> std::result::Result<(), StageFailure<E>>;
+    fn cleanup_box(&self, state: Box<dyn Any + Send>) -> std::result::Result<(), NodeFailure<E>>;
 }
 
-struct RuntimeStageContext {
+struct RuntimeNodeContext {
     output: LinkSender,
     output_stats: Arc<LinkStats>,
     output_acquire: Option<DynAcquire>,
@@ -845,49 +861,49 @@ struct RuntimeStageContext {
     internal_failure: channel::Sender<InternalFailure>,
 }
 
-struct StageAdapter<S>
+struct NodeAdapter<S>
 where
-    S: Stage,
+    S: Node,
 {
     stage: S,
 }
 
-impl<S> DynStage<S::Error> for StageAdapter<S>
+impl<S> DynNode<S::Error> for NodeAdapter<S>
 where
-    S: Stage,
+    S: Node,
 {
-    fn init_box(&self) -> std::result::Result<Box<dyn Any + Send>, StageFailure<S::Error>> {
+    fn init_box(&self) -> std::result::Result<Box<dyn Any + Send>, NodeFailure<S::Error>> {
         self.stage
             .init()
             .map(|state| Box::new(state) as Box<dyn Any + Send>)
-            .map_err(StageFailure::Init)
+            .map_err(NodeFailure::Init)
     }
 
     fn process_box(
         &self,
         state: &mut dyn Any,
         input: Message,
-        ctx: RuntimeStageContext,
-    ) -> std::result::Result<(), StageFailure<S::Error>> {
+        ctx: RuntimeNodeContext,
+    ) -> std::result::Result<(), NodeFailure<S::Error>> {
         let state = state
             .downcast_mut::<S::State>()
-            .ok_or_else(|| StageFailure::Internal("stage state type mismatch".to_string()))?;
+            .ok_or_else(|| NodeFailure::Internal("node state type mismatch".to_string()))?;
         let input = input
             .downcast::<S::Input>()
             .map(|input| *input)
-            .map_err(|_| StageFailure::Internal("stage input type mismatch".to_string()))?;
+            .map_err(|_| NodeFailure::Internal("node input type mismatch".to_string()))?;
         let output_acquire = match ctx.output_acquire {
             Some(acquire) => Some(
                 Arc::downcast::<Arc<AcquireFn<S::Output>>>(acquire)
                     .map_err(|_| {
-                        StageFailure::Internal("stage output factory type mismatch".to_string())
+                        NodeFailure::Internal("node output factory type mismatch".to_string())
                     })?
                     .as_ref()
                     .clone(),
             ),
             None => None,
         };
-        let mut ctx = StageContext {
+        let mut ctx = NodeContext {
             output: ctx.output,
             output_stats: ctx.output_stats,
             output_acquire,
@@ -898,25 +914,25 @@ where
         };
         self.stage
             .process(state, input, &mut ctx)
-            .map_err(StageFailure::Process)
+            .map_err(NodeFailure::Process)
     }
 
     fn cleanup_box(
         &self,
         state: Box<dyn Any + Send>,
-    ) -> std::result::Result<(), StageFailure<S::Error>> {
+    ) -> std::result::Result<(), NodeFailure<S::Error>> {
         let state = state
             .downcast::<S::State>()
             .map(|state| *state)
-            .map_err(|_| StageFailure::Internal("stage cleanup state type mismatch".to_string()))?;
-        self.stage.cleanup(state).map_err(StageFailure::Cleanup)
+            .map_err(|_| NodeFailure::Internal("node cleanup state type mismatch".to_string()))?;
+        self.stage.cleanup(state).map_err(NodeFailure::Cleanup)
     }
 }
 
-struct InlineStage<Init, Process, Cleanup, State, In, Out, E>
+struct InlineNode<Init, Process, Cleanup, State, In, Out, E>
 where
     Init: Fn() -> std::result::Result<State, E> + Send + Sync + 'static,
-    Process: Fn(&mut State, In, &mut StageContext<Out, E>) -> std::result::Result<(), E>
+    Process: Fn(&mut State, In, &mut NodeContext<Out, E>) -> std::result::Result<(), E>
         + Send
         + Sync
         + 'static,
@@ -932,11 +948,11 @@ where
     _marker: PhantomData<fn(State, In, Out, E)>,
 }
 
-impl<Init, Process, Cleanup, State, In, Out, E> Stage
-    for InlineStage<Init, Process, Cleanup, State, In, Out, E>
+impl<Init, Process, Cleanup, State, In, Out, E> Node
+    for InlineNode<Init, Process, Cleanup, State, In, Out, E>
 where
     Init: Fn() -> std::result::Result<State, E> + Send + Sync + 'static,
-    Process: Fn(&mut State, In, &mut StageContext<Out, E>) -> std::result::Result<(), E>
+    Process: Fn(&mut State, In, &mut NodeContext<Out, E>) -> std::result::Result<(), E>
         + Send
         + Sync
         + 'static,
@@ -959,7 +975,7 @@ where
         &self,
         state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         (self.process)(state, input, ctx)
     }
@@ -969,20 +985,29 @@ where
     }
 }
 
-pub struct StageSpec<In, Out, E>
+#[derive(Clone, Debug, Default)]
+struct ThreadPolicyHints {
+    fixed_threads: Option<usize>,
+    max_threads: Option<usize>,
+    initial_threads: Option<usize>,
+    scale_policy: Option<NodeScalePolicy>,
+}
+
+pub struct NodeSpec<In, Out, E>
 where
     In: Send + 'static,
     Out: Send + 'static,
     E: Debug + Display + Send + 'static,
 {
     name: String,
-    stage: Arc<dyn DynStage<E>>,
+    stage: Arc<dyn DynNode<E>>,
     output_acquire_builder: Option<Arc<dyn OutputAcquireBuilder + Send + Sync>>,
-    anchor: Option<AnchorHints>,
+    is_anchor: bool,
+    thread_hints: ThreadPolicyHints,
     _marker: PhantomData<fn(In) -> Out>,
 }
 
-impl<In, Out, E> StageSpec<In, Out, E>
+impl<In, Out, E> NodeSpec<In, Out, E>
 where
     In: Send + 'static,
     Out: Send + 'static,
@@ -1001,51 +1026,48 @@ where
         self
     }
 
+    pub fn with_scale_policy(mut self, policy: NodeScalePolicy) -> Self {
+        self.thread_hints.scale_policy = Some(policy);
+        self
+    }
+
+    pub fn scalable_threads(mut self, initial_threads: usize, max_threads: usize) -> Self {
+        self.thread_hints.initial_threads = Some(initial_threads);
+        self.thread_hints.max_threads = Some(max_threads);
+        self
+    }
+
     pub fn max_threads(mut self, max_threads: usize) -> Self {
-        self.anchor
-            .get_or_insert_with(AnchorHints::default)
-            .max_threads = Some(max_threads);
+        self.thread_hints.max_threads = Some(max_threads);
         self
     }
 
     pub fn initial_threads(mut self, initial_threads: usize) -> Self {
-        self.anchor
-            .get_or_insert_with(AnchorHints::default)
-            .initial_threads = Some(initial_threads);
+        self.thread_hints.initial_threads = Some(initial_threads);
         self
     }
 
     pub fn fixed_threads(mut self, fixed_threads: usize) -> Self {
-        let anchor = self.anchor.get_or_insert_with(AnchorHints::default);
-        anchor.fixed_threads = Some(fixed_threads);
-        anchor.initial_threads = Some(fixed_threads);
-        anchor.max_threads = Some(fixed_threads);
+        self.thread_hints.fixed_threads = Some(fixed_threads);
         self
     }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct AnchorHints {
-    max_threads: Option<usize>,
-    initial_threads: Option<usize>,
-    fixed_threads: Option<usize>,
 }
 
 pub trait BufferLeaseOutput<T> {}
 
 impl<T> BufferLeaseOutput<T> for BufferLease<T> where T: Recycle + Send + 'static {}
 
-pub trait IntoStageSpec<E>
+pub trait IntoNodeSpec<E>
 where
     E: Debug + Display + Send + 'static,
 {
     type Input: Send + 'static;
     type Output: Send + 'static;
 
-    fn into_stage_spec(self) -> StageSpec<Self::Input, Self::Output, E>;
+    fn into_node_spec(self) -> NodeSpec<Self::Input, Self::Output, E>;
 }
 
-impl<In, Out, E> IntoStageSpec<E> for StageSpec<In, Out, E>
+impl<In, Out, E> IntoNodeSpec<E> for NodeSpec<In, Out, E>
 where
     In: Send + 'static,
     Out: Send + 'static,
@@ -1054,74 +1076,75 @@ where
     type Input = In;
     type Output = Out;
 
-    fn into_stage_spec(self) -> StageSpec<In, Out, E> {
+    fn into_node_spec(self) -> NodeSpec<In, Out, E> {
         self
     }
 }
 
-impl<S> IntoStageSpec<S::Error> for S
+impl<S> IntoNodeSpec<S::Error> for S
 where
-    S: Stage,
+    S: Node,
 {
     type Input = S::Input;
     type Output = S::Output;
 
-    fn into_stage_spec(self) -> StageSpec<S::Input, S::Output, S::Error> {
-        stage(default_stage_name::<S>(), self)
+    fn into_node_spec(self) -> NodeSpec<S::Input, S::Output, S::Error> {
+        node(default_node_name::<S>(), self)
     }
 }
 
-pub trait StageExt: Stage + Sized {
+pub trait NodeExt: Node + Sized {
     fn with_reusable_output<T, Factory>(
         self,
         factory: Factory,
-    ) -> StageSpec<Self::Input, Self::Output, Self::Error>
+    ) -> NodeSpec<Self::Input, Self::Output, Self::Error>
     where
         Self::Output: BufferLeaseOutput<T>,
         T: Recycle + Send + 'static,
         Factory: Fn() -> T + Send + Sync + 'static,
     {
-        stage(default_stage_name::<Self>(), self).with_reusable_output(factory)
+        node(default_node_name::<Self>(), self).with_reusable_output(factory)
     }
 }
 
-impl<S> StageExt for S where S: Stage {}
+impl<S> NodeExt for S where S: Node {}
 
-pub fn stage<S>(name: impl Into<String>, stage_impl: S) -> StageSpec<S::Input, S::Output, S::Error>
+pub fn node<S>(name: impl Into<String>, stage_impl: S) -> NodeSpec<S::Input, S::Output, S::Error>
 where
-    S: Stage,
+    S: Node,
 {
-    StageSpec {
+    NodeSpec {
         name: name.into(),
-        stage: Arc::new(StageAdapter { stage: stage_impl }),
+        stage: Arc::new(NodeAdapter { stage: stage_impl }),
         output_acquire_builder: None,
-        anchor: None,
+        is_anchor: false,
+        thread_hints: ThreadPolicyHints::default(),
         _marker: PhantomData,
     }
 }
 
-pub fn anchor<S, E>(stage_like: S) -> StageSpec<S::Input, S::Output, E>
+pub fn anchor<S, E>(node_like: S) -> NodeSpec<S::Input, S::Output, E>
 where
-    S: IntoStageSpec<E>,
+    S: IntoNodeSpec<E>,
     E: Debug + Display + Send + 'static,
 {
-    let mut spec = stage_like.into_stage_spec();
-    spec.anchor = Some(spec.anchor.unwrap_or_default());
+    let mut spec = node_like.into_node_spec();
+    spec.is_anchor = true;
     spec
 }
 
-fn default_stage_name<S>() -> String {
+fn default_node_name<S>() -> String {
     std::any::type_name::<S>()
         .rsplit("::")
         .next()
-        .unwrap_or("stage")
+        .unwrap_or("node")
         .to_string()
 }
 
-pub struct InlineStageBuilder<Init, Process, Cleanup, State, In, Out, E>
+pub struct InlineNodeBuilder<Init, Process, Cleanup, State, In, Out, E>
 where
     Init: Fn() -> std::result::Result<State, E> + Send + Sync + 'static,
-    Process: Fn(&mut State, In, &mut StageContext<Out, E>) -> std::result::Result<(), E>
+    Process: Fn(&mut State, In, &mut NodeContext<Out, E>) -> std::result::Result<(), E>
         + Send
         + Sync
         + 'static,
@@ -1139,10 +1162,10 @@ where
 }
 
 impl<Init, Process, Cleanup, State, In, Out, E>
-    InlineStageBuilder<Init, Process, Cleanup, State, In, Out, E>
+    InlineNodeBuilder<Init, Process, Cleanup, State, In, Out, E>
 where
     Init: Fn() -> std::result::Result<State, E> + Send + Sync + 'static,
-    Process: Fn(&mut State, In, &mut StageContext<Out, E>) -> std::result::Result<(), E>
+    Process: Fn(&mut State, In, &mut NodeContext<Out, E>) -> std::result::Result<(), E>
         + Send
         + Sync
         + 'static,
@@ -1155,11 +1178,11 @@ where
     pub fn with_cleanup<NextCleanup>(
         self,
         cleanup: NextCleanup,
-    ) -> InlineStageBuilder<Init, Process, NextCleanup, State, In, Out, E>
+    ) -> InlineNodeBuilder<Init, Process, NextCleanup, State, In, Out, E>
     where
         NextCleanup: Fn(State) -> std::result::Result<(), E> + Send + Sync + 'static,
     {
-        InlineStageBuilder {
+        InlineNodeBuilder {
             name: self.name,
             init: self.init,
             process: self.process,
@@ -1168,21 +1191,21 @@ where
         }
     }
 
-    pub fn with_reusable_output<T, Factory>(self, factory: Factory) -> StageSpec<In, Out, E>
+    pub fn with_reusable_output<T, Factory>(self, factory: Factory) -> NodeSpec<In, Out, E>
     where
         Out: BufferLeaseOutput<T>,
         T: Recycle + Send + 'static,
         Factory: Fn() -> T + Send + Sync + 'static,
     {
-        self.into_stage_spec().with_reusable_output(factory)
+        self.into_node_spec().with_reusable_output(factory)
     }
 }
 
-impl<Init, Process, Cleanup, State, In, Out, E> IntoStageSpec<E>
-    for InlineStageBuilder<Init, Process, Cleanup, State, In, Out, E>
+impl<Init, Process, Cleanup, State, In, Out, E> IntoNodeSpec<E>
+    for InlineNodeBuilder<Init, Process, Cleanup, State, In, Out, E>
 where
     Init: Fn() -> std::result::Result<State, E> + Send + Sync + 'static,
-    Process: Fn(&mut State, In, &mut StageContext<Out, E>) -> std::result::Result<(), E>
+    Process: Fn(&mut State, In, &mut NodeContext<Out, E>) -> std::result::Result<(), E>
         + Send
         + Sync
         + 'static,
@@ -1195,10 +1218,10 @@ where
     type Input = In;
     type Output = Out;
 
-    fn into_stage_spec(self) -> StageSpec<In, Out, E> {
-        stage(
+    fn into_node_spec(self) -> NodeSpec<In, Out, E> {
+        node(
             self.name,
-            InlineStage {
+            InlineNode {
                 init: self.init,
                 process: self.process,
                 cleanup: self.cleanup,
@@ -1212,14 +1235,14 @@ fn default_inline_cleanup<State, E>(_state: State) -> std::result::Result<(), E>
     Ok(())
 }
 
-pub fn inline_stage<Init, Process, State, In, Out, E>(
+pub fn inline_node<Init, Process, State, In, Out, E>(
     name: impl Into<String>,
     init: Init,
     process: Process,
-) -> InlineStageBuilder<Init, Process, fn(State) -> std::result::Result<(), E>, State, In, Out, E>
+) -> InlineNodeBuilder<Init, Process, fn(State) -> std::result::Result<(), E>, State, In, Out, E>
 where
     Init: Fn() -> std::result::Result<State, E> + Send + Sync + 'static,
-    Process: Fn(&mut State, In, &mut StageContext<Out, E>) -> std::result::Result<(), E>
+    Process: Fn(&mut State, In, &mut NodeContext<Out, E>) -> std::result::Result<(), E>
         + Send
         + Sync
         + 'static,
@@ -1228,7 +1251,7 @@ where
     Out: Send + 'static,
     E: Debug + Display + Send + 'static,
 {
-    InlineStageBuilder {
+    InlineNodeBuilder {
         name: name.into(),
         init,
         process,
@@ -1268,7 +1291,7 @@ where
 }
 
 #[derive(Debug)]
-enum StageFailure<E> {
+enum NodeFailure<E> {
     Init(E),
     Process(E),
     Cleanup(E),
@@ -1778,7 +1801,7 @@ where
     input_link: usize,
     output_link: usize,
     link_count: usize,
-    stages: Vec<GraphStageSpec<E>>,
+    nodes: Vec<GraphNodeSpec<E>>,
     external_count: usize,
     #[cfg(feature = "feeder")]
     feeder_links: HashMap<usize, FeederLinkConfig>,
@@ -1791,7 +1814,7 @@ where
     E: Debug + Display + Send + 'static,
 {
     link_count: usize,
-    stages: Vec<GraphStageSpec<E>>,
+    nodes: Vec<GraphNodeSpec<E>>,
     external_count: usize,
     #[cfg(feature = "feeder")]
     feeder_links: HashMap<usize, FeederLinkConfig>,
@@ -1806,7 +1829,7 @@ where
     pub fn new() -> Self {
         Self {
             link_count: 1,
-            stages: Vec::new(),
+            nodes: Vec::new(),
             external_count: 0,
             #[cfg(feature = "feeder")]
             feeder_links: HashMap::new(),
@@ -1833,33 +1856,34 @@ where
         }
     }
 
-    pub fn add_stage<S>(
+    pub fn add_node<S>(
         &mut self,
         input: GraphLink<S::Input>,
         stage_like: S,
     ) -> GraphLink<S::Output>
     where
-        S: IntoStageSpec<E>,
+        S: IntoNodeSpec<E>,
     {
         let output = self.link();
-        self.add_stage_to(input, stage_like, output);
+        self.add_node_to(input, stage_like, output);
         output
     }
 
-    pub fn add_stage_to<S>(
+    pub fn add_node_to<S>(
         &mut self,
         input: GraphLink<S::Input>,
         stage_like: S,
         output: GraphLink<S::Output>,
     ) where
-        S: IntoStageSpec<E>,
+        S: IntoNodeSpec<E>,
     {
-        let stage = stage_like.into_stage_spec();
-        self.stages.push(GraphStageSpec {
+        let stage = stage_like.into_node_spec();
+        self.nodes.push(GraphNodeSpec {
             name: stage.name,
             stage: Some(stage.stage),
             output_acquire_builder: stage.output_acquire_builder,
-            anchor: stage.anchor,
+            is_anchor: stage.is_anchor,
+            thread_hints: stage.thread_hints,
             input_link: input.index,
             output_links: vec![output.index],
             weighted_branch_config: None,
@@ -1892,11 +1916,12 @@ where
     ) where
         T: Send + 'static,
     {
-        self.stages.push(GraphStageSpec {
+        self.nodes.push(GraphNodeSpec {
             name: name.into(),
             stage: None,
             output_acquire_builder: None,
-            anchor: None,
+            is_anchor: false,
+            thread_hints: ThreadPolicyHints::default(),
             input_link: input.index,
             output_links: vec![left.index, right.index],
             weighted_branch_config: Some(config),
@@ -1933,11 +1958,12 @@ where
             _marker: PhantomData,
         };
         self.external_count += 1;
-        self.stages.push(GraphStageSpec {
+        self.nodes.push(GraphNodeSpec {
             name: name.into(),
             stage: None,
             output_acquire_builder: None,
-            anchor: None,
+            is_anchor: false,
+            thread_hints: ThreadPolicyHints::default(),
             input_link: input.index,
             output_links: vec![output.index],
             weighted_branch_config: None,
@@ -1962,7 +1988,7 @@ where
             input_link: 0,
             output_link: output.index,
             link_count: self.link_count.max(output.index + 1),
-            stages: self.stages,
+            nodes: self.nodes,
             external_count: self.external_count,
             #[cfg(feature = "feeder")]
             feeder_links: self.feeder_links,
@@ -1981,40 +2007,88 @@ where
     }
 }
 
-struct GraphStageSpec<E>
+struct GraphNodeSpec<E>
 where
     E: Debug + Display + Send + 'static,
 {
     name: String,
-    stage: Option<Arc<dyn DynStage<E>>>,
+    stage: Option<Arc<dyn DynNode<E>>>,
     output_acquire_builder: Option<Arc<dyn OutputAcquireBuilder + Send + Sync>>,
-    anchor: Option<AnchorHints>,
+    is_anchor: bool,
+    thread_hints: ThreadPolicyHints,
     input_link: usize,
     output_links: Vec<usize>,
     weighted_branch_config: Option<SingleThreadWeightedBranchConfig>,
     external_index: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ResolvedThreadPolicy {
+    Fixed(usize),
+    Scalable(ResolvedScalePolicy),
+    ImplicitSupport,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ResolvedScalePolicy {
+    initial_threads: usize,
+    max_threads: usize,
+    target_queue_seconds: f64,
+    low_queue_seconds: f64,
+    scale_down_after: Duration,
+    underutilized_busy_ratio: f64,
+}
+
+fn thread_policy_kind(policy: ResolvedThreadPolicy) -> NodeThreadPolicyKind {
+    match policy {
+        ResolvedThreadPolicy::Fixed(_) => NodeThreadPolicyKind::Fixed,
+        ResolvedThreadPolicy::Scalable(_) => NodeThreadPolicyKind::Scalable,
+        ResolvedThreadPolicy::ImplicitSupport => NodeThreadPolicyKind::ImplicitSupport,
+    }
+}
+
+fn fixed_thread_count(policy: ResolvedThreadPolicy) -> Option<usize> {
+    match policy {
+        ResolvedThreadPolicy::Fixed(count) => Some(count),
+        _ => None,
+    }
+}
+
+fn max_thread_count(policy: ResolvedThreadPolicy) -> Option<usize> {
+    match policy {
+        ResolvedThreadPolicy::Scalable(policy) => Some(policy.max_threads),
+        _ => None,
+    }
+}
+
+fn target_queue_seconds(policy: ResolvedThreadPolicy) -> Option<f64> {
+    match policy {
+        ResolvedThreadPolicy::Scalable(policy) => Some(policy.target_queue_seconds),
+        _ => None,
+    }
+}
+
+fn low_queue_seconds(policy: ResolvedThreadPolicy) -> Option<f64> {
+    match policy {
+        ResolvedThreadPolicy::Scalable(policy) => Some(policy.low_queue_seconds),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
-struct RuntimeStage<E>
+struct RuntimeNode<E>
 where
     E: Debug + Display + Send + 'static,
 {
     name: String,
-    stage: Option<Arc<dyn DynStage<E>>>,
+    stage: Option<Arc<dyn DynNode<E>>>,
     output_acquire: Option<DynAcquire>,
-    anchor: Option<ResolvedAnchor>,
+    is_anchor: bool,
+    thread_policy: ResolvedThreadPolicy,
     input_link: usize,
     output_links: Vec<usize>,
     weighted_branch_config: Option<SingleThreadWeightedBranchConfig>,
     is_external: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ResolvedAnchor {
-    max_threads: usize,
-    initial_threads: usize,
-    fixed_threads: Option<usize>,
 }
 
 enum WorkerCommand<E>
@@ -2030,8 +2104,8 @@ struct WorkerAssignment<E>
 where
     E: Debug + Display + Send + 'static,
 {
-    stage_index: usize,
-    stage: Arc<dyn DynStage<E>>,
+    node_index: usize,
+    stage: Arc<dyn DynNode<E>>,
     input: LinkReceiver,
     input_stats: Arc<LinkStats>,
     output: LinkSender,
@@ -2047,7 +2121,7 @@ where
 }
 
 struct WeightedBranchAssignment {
-    stage_index: usize,
+    node_index: usize,
     input: LinkReceiver,
     input_stats: Arc<LinkStats>,
     left_output: LinkSender,
@@ -2260,13 +2334,13 @@ where
     },
     Parked {
         worker_id: usize,
-        stage_index: usize,
+        node_index: usize,
     },
     Failed {
         worker_id: usize,
-        stage_index: usize,
+        node_index: usize,
         worker: String,
-        failure: StageFailure<E>,
+        failure: NodeFailure<E>,
     },
     Stopped,
 }
@@ -2278,7 +2352,7 @@ where
     name: String,
     command: channel::Sender<WorkerCommand<E>>,
     handle: Option<JoinHandle<()>>,
-    active_stage: Option<usize>,
+    active_node: Option<usize>,
     retire: Option<Arc<AtomicBool>>,
     stats: Arc<WorkerStats>,
 }
@@ -2307,55 +2381,42 @@ enum ScaleDirection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScaleReason {
     Support,
-    AnchorProbe,
-    AnchorRevert,
+    Scalable,
+    AnchorPressure,
     BudgetPressure,
     Idle,
 }
 
 struct PendingScale {
     worker_id: usize,
-    stage_index: usize,
+    node_index: usize,
     direction: ScaleDirection,
     reason: ScaleReason,
 }
 
-struct StageControl {
+struct NodeControl {
     is_external: bool,
     is_weighted_branch: bool,
+    is_anchor: bool,
+    thread_policy: ResolvedThreadPolicy,
     processed_count: u64,
     busy_ratio: f64,
     service_time_ewma: f64,
     per_worker_throughput: f64,
     desired_workers: usize,
+    backlog_seconds: f64,
     last_sample_processed: u64,
-    scaling_state: StageScalingState,
+    scaling_state: NodeScalingState,
     settling: bool,
     settle_samples: u32,
     settle_observed_work: bool,
-    idle_samples: u32,
+    scale_down_eligible_since: Option<Instant>,
+    last_anchor_pressure_reason: Option<AnchorPressureReason>,
     last_operation: Option<(ScaleDirection, Instant)>,
-    anchor: Option<AnchorControl>,
-}
-
-struct AnchorControl {
-    max_threads: usize,
-    fixed_threads: Option<usize>,
-    warmup_complete: bool,
-    probe: Option<AnchorProbe>,
-    cooldown_samples: u32,
-    last_probe_outcome: AnchorProbeOutcome,
-    last_probe_reason: AnchorProbeReason,
-}
-
-struct AnchorProbe {
-    worker_id: usize,
-    samples: u32,
-    observed_work: bool,
 }
 
 #[derive(Default)]
-struct StageSample {
+struct NodeSample {
     process_nanos: u64,
     wait_nanos: u64,
     processed_items: u64,
@@ -2390,7 +2451,7 @@ impl Default for LinkControl {
     }
 }
 
-fn resolve_anchor_hints<E>(hints: AnchorHints) -> Result<ResolvedAnchor, E>
+fn resolve_scale_policy<E>(mut policy: NodeScalePolicy) -> Result<ResolvedScalePolicy, E>
 where
     E: Debug + Display + Send + 'static,
 {
@@ -2398,72 +2459,126 @@ where
         .map(|value| value.get())
         .unwrap_or(1)
         .max(1);
-    let max_threads = hints.max_threads.unwrap_or(available);
-    if max_threads == 0 {
-        return Err(PiperError::InvalidAnchorThreads);
+    if policy.max_threads == 0 {
+        policy.max_threads = available;
     }
-    let initial_threads = hints
-        .initial_threads
-        .unwrap_or_else(|| max_threads.div_ceil(2).max(1));
-    if initial_threads == 0 {
-        return Err(PiperError::InvalidAnchorThreads);
+    if policy.initial_threads == 0 {
+        policy.initial_threads = policy.max_threads.div_ceil(2).max(1);
     }
-    if hints.fixed_threads.is_some_and(|threads| threads == 0) {
-        return Err(PiperError::InvalidAnchorThreads);
+    if policy.max_threads == 0 || policy.initial_threads == 0 {
+        return Err(PiperError::InvalidThreadCount);
     }
-
-    Ok(ResolvedAnchor {
-        max_threads,
-        initial_threads: initial_threads.min(max_threads),
-        fixed_threads: hints.fixed_threads,
+    Ok(ResolvedScalePolicy {
+        max_threads: policy.max_threads,
+        initial_threads: policy.initial_threads.min(policy.max_threads),
+        target_queue_seconds: policy.target_queue_seconds,
+        low_queue_seconds: policy.low_queue_seconds,
+        scale_down_after: policy.scale_down_after,
+        underutilized_busy_ratio: policy.underutilized_busy_ratio,
     })
 }
 
-fn build_stage_controls<E>(stages: &[RuntimeStage<E>]) -> Vec<StageControl>
+fn resolve_thread_policy<E>(
+    is_anchor: bool,
+    hints: ThreadPolicyHints,
+) -> Result<ResolvedThreadPolicy, E>
 where
     E: Debug + Display + Send + 'static,
 {
-    stages
+    if let Some(fixed_threads) = hints.fixed_threads {
+        if fixed_threads == 0 {
+            return Err(PiperError::InvalidThreadCount);
+        }
+        return Ok(ResolvedThreadPolicy::Fixed(fixed_threads));
+    }
+
+    let needs_scalable = hints.scale_policy.is_some()
+        || hints.max_threads.is_some()
+        || hints.initial_threads.is_some()
+        || is_anchor;
+
+    if needs_scalable {
+        let mut policy = hints.scale_policy.unwrap_or_default();
+        if let Some(max_threads) = hints.max_threads {
+            policy.max_threads = max_threads;
+        }
+        if let Some(initial_threads) = hints.initial_threads {
+            policy.initial_threads = initial_threads;
+        }
+        return Ok(ResolvedThreadPolicy::Scalable(resolve_scale_policy(policy)?));
+    }
+
+    Ok(ResolvedThreadPolicy::ImplicitSupport)
+}
+
+fn build_node_controls<E>(nodes: &[RuntimeNode<E>]) -> Vec<NodeControl>
+where
+    E: Debug + Display + Send + 'static,
+{
+    nodes
         .iter()
-        .map(|stage| StageControl {
-            is_external: stage.is_external,
-            is_weighted_branch: stage.weighted_branch_config.is_some(),
+        .map(|node| NodeControl {
+            is_external: node.is_external,
+            is_weighted_branch: node.weighted_branch_config.is_some(),
+            is_anchor: node.is_anchor,
+            thread_policy: node.thread_policy,
             processed_count: 0,
             busy_ratio: 0.0,
             service_time_ewma: 0.0,
             per_worker_throughput: 0.0,
             desired_workers: 1,
+            backlog_seconds: 0.0,
             last_sample_processed: 0,
-            scaling_state: StageScalingState::Eligible,
+            scaling_state: NodeScalingState::Eligible,
             settling: false,
             settle_samples: 0,
             settle_observed_work: false,
-            idle_samples: 0,
+            scale_down_eligible_since: None,
+            last_anchor_pressure_reason: None,
             last_operation: None,
-            anchor: stage.anchor.map(|anchor| AnchorControl {
-                max_threads: anchor.max_threads,
-                fixed_threads: anchor.fixed_threads,
-                warmup_complete: false,
-                probe: None,
-                cooldown_samples: 0,
-                last_probe_outcome: AnchorProbeOutcome::None,
-                last_probe_reason: AnchorProbeReason::None,
-            }),
         })
         .collect()
 }
 
-fn resolve_global_worker_cap(configured: Option<usize>, stage_count: usize) -> usize {
+fn resolve_global_worker_cap(configured: Option<usize>, node_count: usize, required_base: usize) -> usize {
     let available = thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(1)
         .max(1);
     configured
-        .unwrap_or_else(|| available.saturating_mul(2).max(stage_count))
-        .max(stage_count)
+        .unwrap_or_else(|| available.saturating_mul(2).max(node_count))
+        .max(node_count)
+        .max(required_base)
 }
 
-fn validate_graph_is_acyclic<E>(stages: &[GraphStageSpec<E>]) -> Result<(), E>
+fn startup_worker_count(policy: ResolvedThreadPolicy) -> (usize, usize) {
+    match policy {
+        ResolvedThreadPolicy::Fixed(count) => (count, 0),
+        ResolvedThreadPolicy::Scalable(policy) => (1, policy.initial_threads.saturating_sub(1)),
+        ResolvedThreadPolicy::ImplicitSupport => (1, 0),
+    }
+}
+
+fn required_base_workers<E>(nodes: &[RuntimeNode<E>]) -> usize
+where
+    E: Debug + Display + Send + 'static,
+{
+    nodes
+        .iter()
+        .map(|node| {
+            if node.is_external {
+                0
+            } else if node.weighted_branch_config.is_some() {
+                1
+            } else {
+                startup_worker_count(node.thread_policy).0
+                    + startup_worker_count(node.thread_policy).1
+            }
+        })
+        .sum()
+}
+
+fn validate_graph_is_acyclic<E>(stages: &[GraphNodeSpec<E>]) -> Result<(), E>
 where
     E: Debug + Display + Send + 'static,
 {
@@ -2537,15 +2652,15 @@ where
     E: Debug + Display + Send + 'static,
 {
     pub fn start(config: PiperConfig, graph: PipelineGraph<In, Out, E>) -> Result<Self, E> {
-        if graph.stages.is_empty() {
-            return Err(PiperError::NoStages);
+        if graph.nodes.is_empty() {
+            return Err(PiperError::NoNodes);
         }
 
         let PipelineGraph {
             input_link,
             output_link,
             link_count,
-            stages,
+            nodes: stages,
             external_count,
             #[cfg(feature = "feeder")]
             feeder_links,
@@ -2561,13 +2676,13 @@ where
         for stage in &stages {
             if stage.input_link >= link_count {
                 return Err(PiperError::InvalidGraph {
-                    message: format!("stage `{}` references a missing link", stage.name),
+                    message: format!("node `{}` references a missing link", stage.name),
                 });
             }
             for &output_link in &stage.output_links {
                 if output_link >= link_count {
                     return Err(PiperError::InvalidGraph {
-                        message: format!("stage `{}` references a missing link", stage.name),
+                        message: format!("node `{}` references a missing link", stage.name),
                     });
                 }
             }
@@ -2592,16 +2707,16 @@ where
                 }
             } else if stage.output_links.len() != 1 {
                 return Err(PiperError::InvalidGraph {
-                    message: format!("stage `{}` must have exactly one output link", stage.name),
+                    message: format!("node `{}` must have exactly one output link", stage.name),
                 });
             }
         }
         validate_graph_is_acyclic(&stages)?;
 
-        let anchor_count = stages.iter().filter(|stage| stage.anchor.is_some()).count();
+        let anchor_count = stages.iter().filter(|stage| stage.is_anchor).count();
         if anchor_count == 0 && config.global_worker_cap == Some(0) {
             return Err(PiperError::InvalidGraph {
-                message: "unanchored graphs require a finite non-zero worker cap".to_string(),
+                message: "graphs without anchor nodes require a finite non-zero worker cap".to_string(),
             });
         }
 
@@ -2673,15 +2788,17 @@ where
         let runtime_stages: Vec<_> = stages
             .into_iter()
             .map(|stage| {
-                let anchor = stage.anchor.map(resolve_anchor_hints).transpose()?;
+                let thread_policy =
+                    resolve_thread_policy(stage.is_anchor, stage.thread_hints)?;
                 let is_external = stage.external_index.is_some();
-                Ok(RuntimeStage {
+                Ok(RuntimeNode {
                     name: stage.name,
                     stage: stage.stage,
                     output_acquire: stage
                         .output_acquire_builder
                         .map(|builder| builder.build(lease_runtime.clone())),
-                    anchor,
+                    is_anchor: stage.is_anchor,
+                    thread_policy,
                     input_link: stage.input_link,
                     output_links: stage.output_links,
                     weighted_branch_config: stage.weighted_branch_config,
@@ -2690,8 +2807,12 @@ where
             })
             .collect::<Result<Vec<_>, E>>()?;
 
-        let global_worker_cap =
-            resolve_global_worker_cap(config.global_worker_cap, runtime_stages.len());
+        let required_base = required_base_workers(&runtime_stages);
+        let global_worker_cap = resolve_global_worker_cap(
+            config.global_worker_cap,
+            runtime_stages.len(),
+            required_base,
+        );
 
         let snapshot = Arc::new(RwLock::new(PiperSnapshot {
             links: (0..link_count)
@@ -2705,10 +2826,10 @@ where
                     smoothed_len: 0.0,
                 })
                 .collect(),
-            stages: runtime_stages
+            nodes: runtime_stages
                 .iter()
                 .enumerate()
-                .map(|(index, stage)| StageSnapshot {
+                .map(|(index, stage)| NodeSnapshot {
                     index,
                     name: stage.name.clone(),
                     input_link: stage.input_link,
@@ -2720,11 +2841,14 @@ where
                     service_time: Duration::ZERO,
                     per_worker_throughput: 0.0,
                     desired_workers: 1,
-                    scaling_state: StageScalingState::Eligible,
-                    is_anchor: stage.anchor.is_some(),
-                    is_fixed_anchor: stage
-                        .anchor
-                        .is_some_and(|anchor| anchor.fixed_threads.is_some()),
+                    scaling_state: NodeScalingState::Eligible,
+                    is_anchor: stage.is_anchor,
+                    thread_policy_kind: thread_policy_kind(stage.thread_policy),
+                    fixed_thread_count: fixed_thread_count(stage.thread_policy),
+                    max_thread_count: max_thread_count(stage.thread_policy),
+                    target_queue_seconds: target_queue_seconds(stage.thread_policy),
+                    low_queue_seconds: low_queue_seconds(stage.thread_policy),
+                    backlog_seconds: 0.0,
                     is_external: stage.is_external,
                     external_input_rate: 0.0,
                     external_output_rate: 0.0,
@@ -2734,15 +2858,11 @@ where
                 .iter()
                 .enumerate()
                 .filter_map(|(index, stage)| {
-                    stage.anchor.map(|anchor| AnchorSnapshot {
-                        stage_index: index,
-                        stage_name: stage.name.clone(),
+                    stage.is_anchor.then(|| AnchorSnapshot {
+                        node_index: index,
+                        node_name: stage.name.clone(),
                         active_threads: 0,
-                        max_threads: anchor.max_threads,
-                        fixed_threads: anchor.fixed_threads,
-                        probe_state: AnchorProbeState::WarmingUp,
-                        last_probe_outcome: AnchorProbeOutcome::None,
-                        last_probe_reason: AnchorProbeReason::None,
+                        last_pressure_reason: None,
                     })
                 })
                 .collect(),
@@ -2872,7 +2992,7 @@ where
     }
 }
 
-const TELEMETRY_LOG_VERSION_LINE: &str = "# piper-telemetry-log-v1";
+const TELEMETRY_LOG_VERSION_LINE: &str = "# piper-telemetry-log-v2";
 const TELEMETRY_MANIFEST_PREFIX: &str = "# manifest ";
 
 #[derive(Serialize)]
@@ -2880,13 +3000,13 @@ struct TelemetryLogManifest {
     version: u32,
     format: &'static str,
     links: Vec<ManifestLink>,
-    stages: Vec<ManifestStage>,
+    nodes: Vec<ManifestNode>,
     anchors: Vec<ManifestAnchor>,
     metrics: Vec<ManifestMetric>,
 }
 
 #[derive(Serialize)]
-struct ManifestStage {
+struct ManifestNode {
     id: String,
     index: usize,
     name: String,
@@ -2894,7 +3014,7 @@ struct ManifestStage {
     output_link: String,
     output_links: Vec<String>,
     is_anchor: bool,
-    is_fixed_anchor: bool,
+    thread_policy_kind: String,
     is_external: bool,
 }
 
@@ -3053,15 +3173,15 @@ fn link_object_id(index: usize) -> String {
     format!("link{index}")
 }
 
-fn stage_object_id(index: usize) -> String {
-    format!("stage{index}")
+fn node_object_id(index: usize) -> String {
+    format!("node{index}")
 }
 
 fn anchor_object_id(index: usize) -> String {
     format!("anchor{index}")
 }
 
-fn manifest_stage_name<'a>(stage_id: &'a str, stages: &'a [ManifestStage]) -> &'a str {
+fn manifest_node_name<'a>(stage_id: &'a str, stages: &'a [ManifestNode]) -> &'a str {
     if stage_id == "input" {
         return "input";
     }
@@ -3075,10 +3195,10 @@ fn manifest_stage_name<'a>(stage_id: &'a str, stages: &'a [ManifestStage]) -> &'
         .unwrap_or(stage_id)
 }
 
-fn format_manifest_node_list(ids: &[String], stages: &[ManifestStage]) -> String {
+fn format_manifest_node_list(ids: &[String], stages: &[ManifestNode]) -> String {
     let names: Vec<&str> = ids
         .iter()
-        .map(|id| manifest_stage_name(id, stages))
+        .map(|id| manifest_node_name(id, stages))
         .collect();
     if names.len() == 1 {
         names[0].to_string()
@@ -3113,20 +3233,20 @@ fn manifest_link_label(
     kind: &str,
     producers: &[String],
     consumers: &[String],
-    stages: &[ManifestStage],
+    stages: &[ManifestNode],
 ) -> String {
     match kind {
         "input" => format!("input -> {}", format_manifest_node_list(consumers, stages)),
         "output" => format!("{} -> output", format_manifest_node_list(producers, stages)),
         "fork" => format!(
             "{} -> {}",
-            manifest_stage_name(&producers[0], stages),
+            manifest_node_name(&producers[0], stages),
             format_manifest_node_list(consumers, stages)
         ),
         "join" => format!(
             "{} -> {}",
             format_manifest_node_list(producers, stages),
-            manifest_stage_name(&consumers[0], stages)
+            manifest_node_name(&consumers[0], stages)
         ),
         "fork_join" => format!(
             "{} -> {}",
@@ -3135,8 +3255,8 @@ fn manifest_link_label(
         ),
         _ => format!(
             "{} -> {}",
-            manifest_stage_name(&producers[0], stages),
-            manifest_stage_name(&consumers[0], stages)
+            manifest_node_name(&producers[0], stages),
+            manifest_node_name(&consumers[0], stages)
         ),
     }
 }
@@ -3171,11 +3291,11 @@ fn build_telemetry_manifest(
     let mut producers_by_link = vec![Vec::<String>::new(); link_count];
     let mut consumers_by_link = vec![Vec::<String>::new(); link_count];
 
-    let stages: Vec<ManifestStage> = snapshot
-        .stages
+    let stages: Vec<ManifestNode> = snapshot
+        .nodes
         .iter()
-        .map(|stage| ManifestStage {
-            id: stage_object_id(stage.index),
+        .map(|stage| ManifestNode {
+            id: node_object_id(stage.index),
             index: stage.index,
             name: stage.name.clone(),
             input_link: link_object_id(stage.input_link),
@@ -3186,13 +3306,13 @@ fn build_telemetry_manifest(
                 .map(|&index| link_object_id(index))
                 .collect(),
             is_anchor: stage.is_anchor,
-            is_fixed_anchor: stage.is_fixed_anchor,
+            thread_policy_kind: format!("{:?}", stage.thread_policy_kind),
             is_external: stage.is_external,
         })
         .collect();
 
-    for stage in &snapshot.stages {
-        let stage_id = stage_object_id(stage.index);
+    for stage in &snapshot.nodes {
+        let stage_id = node_object_id(stage.index);
         consumers_by_link[stage.input_link].push(stage_id.clone());
         for &output_link in &stage.output_links {
             producers_by_link[output_link].push(stage_id.clone());
@@ -3207,9 +3327,9 @@ fn build_telemetry_manifest(
         if producers_by_link[link_index].len() > 1 && consumers_by_link[link_index].len() == 1 {
             let consumer_id = &consumers_by_link[link_index][0];
             if let Some(stage) = snapshot
-                .stages
+                .nodes
                 .iter()
-                .find(|stage| stage_object_id(stage.index) == *consumer_id)
+                .find(|stage| node_object_id(stage.index) == *consumer_id)
             {
                 if stage.output_links.iter().any(|&link| link == output_link) {
                     consumers_by_link[link_index] = vec!["output".to_string()];
@@ -3246,7 +3366,7 @@ fn build_telemetry_manifest(
         .map(|(index, anchor)| ManifestAnchor {
             id: anchor_object_id(index),
             index,
-            name: anchor.stage_name.clone(),
+            name: anchor.node_name.clone(),
         })
         .collect();
 
@@ -3355,8 +3475,8 @@ fn build_telemetry_manifest(
         }
     }
 
-    for stage in &snapshot.stages {
-        let object_id = stage_object_id(stage.index);
+    for stage in &snapshot.nodes {
+        let object_id = node_object_id(stage.index);
         for (metric, label, unit) in [
             ("active_threads", "active threads", None),
             ("processed_count", "processed count", None),
@@ -3369,13 +3489,19 @@ fn build_telemetry_manifest(
             ),
             ("desired_workers", "desired workers", None),
             ("scaling_state", "scaling state", None),
+            ("thread_policy_kind", "thread policy", None),
+            ("fixed_thread_count", "fixed threads", None),
+            ("max_thread_count", "max threads", None),
+            ("target_queue_seconds", "target queue seconds", Some("s")),
+            ("low_queue_seconds", "low queue seconds", Some("s")),
+            ("backlog_seconds", "backlog seconds", Some("s")),
         ] {
             push_manifest_metric(
                 &mut metrics,
-                format!("stage{}_{metric}", stage.index),
+                format!("node{}_{metric}", stage.index),
                 &object_id,
-                "stage",
-                "Stages",
+                "node",
+                "Nodes",
                 metric,
                 label,
                 unit,
@@ -3388,9 +3514,9 @@ fn build_telemetry_manifest(
             ] {
                 push_manifest_metric(
                     &mut metrics,
-                    format!("stage{}_{metric}", stage.index),
+                    format!("node{}_{metric}", stage.index),
                     &object_id,
-                    "stage",
+                    "node",
                     "External",
                     metric,
                     label,
@@ -3404,11 +3530,7 @@ fn build_telemetry_manifest(
         let object_id = anchor_object_id(index);
         for (metric, label) in [
             ("active_threads", "active threads"),
-            ("max_threads", "max threads"),
-            ("fixed_threads", "fixed threads"),
-            ("probe_state", "probe state"),
-            ("last_probe_outcome", "last probe outcome"),
-            ("last_probe_reason", "last probe reason"),
+            ("last_pressure_reason", "last pressure reason"),
         ] {
             push_manifest_metric(
                 &mut metrics,
@@ -3424,10 +3546,10 @@ fn build_telemetry_manifest(
     }
 
     TelemetryLogManifest {
-        version: 1,
-        format: "piper-telemetry-log",
+        version: 2,
+        format: "piper-telemetry-log-v2",
         links,
-        stages,
+        nodes: stages,
         anchors,
         metrics,
     }
@@ -3469,13 +3591,13 @@ fn telemetry_log_metric_value(column: &str, snapshot: &PiperSnapshot) -> String 
                     }
                 }
             }
-            if let Some(rest) = column.strip_prefix("stage") {
+            if let Some(rest) = column.strip_prefix("node") {
                 if let Some((index, metric)) = rest.split_once('_') {
-                    if let Ok(stage_index) = index.parse::<usize>() {
+                    if let Ok(node_index) = index.parse::<usize>() {
                         if let Some(stage) = snapshot
-                            .stages
+                            .nodes
                             .iter()
-                            .find(|stage| stage.index == stage_index)
+                            .find(|stage| stage.index == node_index)
                         {
                             return match metric {
                                 "active_threads" => stage.active_threads.to_string(),
@@ -3489,6 +3611,26 @@ fn telemetry_log_metric_value(column: &str, snapshot: &PiperSnapshot) -> String 
                                 }
                                 "desired_workers" => stage.desired_workers.to_string(),
                                 "scaling_state" => format!("{:?}", stage.scaling_state),
+                                "thread_policy_kind" => {
+                                    format!("{:?}", stage.thread_policy_kind)
+                                }
+                                "fixed_thread_count" => stage
+                                    .fixed_thread_count
+                                    .map(|count| count.to_string())
+                                    .unwrap_or_default(),
+                                "max_thread_count" => stage
+                                    .max_thread_count
+                                    .map(|count| count.to_string())
+                                    .unwrap_or_default(),
+                                "target_queue_seconds" => stage
+                                    .target_queue_seconds
+                                    .map(|value| format!("{value:.6}"))
+                                    .unwrap_or_default(),
+                                "low_queue_seconds" => stage
+                                    .low_queue_seconds
+                                    .map(|value| format!("{value:.6}"))
+                                    .unwrap_or_default(),
+                                "backlog_seconds" => format!("{:.6}", stage.backlog_seconds),
                                 "external_input_rate" => {
                                     format!("{:.6}", stage.external_input_rate)
                                 }
@@ -3507,16 +3649,10 @@ fn telemetry_log_metric_value(column: &str, snapshot: &PiperSnapshot) -> String 
                         if let Some(anchor) = snapshot.anchors.get(anchor_index) {
                             return match metric {
                                 "active_threads" => anchor.active_threads.to_string(),
-                                "max_threads" => anchor.max_threads.to_string(),
-                                "fixed_threads" => anchor
-                                    .fixed_threads
-                                    .map(|threads| threads.to_string())
+                                "last_pressure_reason" => anchor
+                                    .last_pressure_reason
+                                    .map(|reason| format!("{reason:?}"))
                                     .unwrap_or_default(),
-                                "probe_state" => format!("{:?}", anchor.probe_state),
-                                "last_probe_outcome" => {
-                                    format!("{:?}", anchor.last_probe_outcome)
-                                }
-                                "last_probe_reason" => format!("{:?}", anchor.last_probe_reason),
                                 _ => String::new(),
                             };
                         }
@@ -3545,7 +3681,7 @@ fn telemetry_log_row(
 
 fn run_supervisor<E>(
     config: PiperConfig,
-    stages: Vec<RuntimeStage<E>>,
+    stages: Vec<RuntimeNode<E>>,
     mut links: Vec<Link>,
     input_link: usize,
     output_link: usize,
@@ -3562,44 +3698,40 @@ where
 {
     let (worker_event_sender, worker_event_receiver) = channel::unbounded::<WorkerEvent<E>>();
     let mut workers = Vec::new();
-    let mut active_by_stage = vec![Vec::<usize>::new(); stages.len()];
+    let mut active_by_node = vec![Vec::<usize>::new(); stages.len()];
     let mut parked = Vec::new();
     let mut link_controls = vec![LinkControl::default(); links.len()];
     let link_queue_lens: Vec<Arc<AtomicUsize>> = (0..links.len())
         .map(|_| Arc::new(AtomicUsize::new(0)))
         .collect();
-    let mut controls = build_stage_controls(&stages);
-    let global_worker_cap = resolve_global_worker_cap(config.global_worker_cap, stages.len());
+    let mut controls = build_node_controls(&stages);
+    let required_base = required_base_workers(&stages);
+    let mut global_worker_cap =
+        resolve_global_worker_cap(config.global_worker_cap, stages.len(), required_base);
     let mut pending_scale = None;
     let mut stored_failure = None;
     let mut supervisor_holds_links = true;
     let mut last_sample_at = Instant::now();
 
-    for stage_index in 0..stages.len() {
-        let active_count = if stages[stage_index].is_external {
-            0
-        } else if stages[stage_index].weighted_branch_config.is_some() {
-            1
-        } else if let Some(anchor) = stages[stage_index].anchor {
-            if let Some(fixed_threads) = anchor.fixed_threads {
-                fixed_threads
-            } else {
-                let support_minimum = stages.len().saturating_sub(1);
-                let anchor_budget = global_worker_cap.saturating_sub(support_minimum).max(1);
-                anchor
-                    .initial_threads
-                    .min(anchor.max_threads)
-                    .min(anchor_budget)
-            }
+    let mut scalable_extra: Vec<(usize, usize)> = Vec::new();
+    for node_index in 0..stages.len() {
+        if stages[node_index].is_external {
+            continue;
+        }
+        let (base, extra) = if stages[node_index].weighted_branch_config.is_some() {
+            (1, 0)
         } else {
-            1
+            startup_worker_count(stages[node_index].thread_policy)
         };
-        for _ in 0..active_count {
+        if extra > 0 {
+            scalable_extra.push((node_index, extra));
+        }
+        for _ in 0..base {
             let name = format!("piper-worker-{}", workers.len());
             let worker_id = spawn_worker(&mut workers, worker_event_sender.clone(), &name)?;
             assign_worker(
                 worker_id,
-                stage_index,
+                node_index,
                 &stages,
                 &links,
                 &config,
@@ -3609,8 +3741,30 @@ where
                 &internal_failure_sender,
                 &link_queue_lens,
                 &mut workers,
-                &mut active_by_stage,
+                &mut active_by_node,
             )?;
+        }
+    }
+
+    for (node_index, mut remaining) in scalable_extra {
+        while remaining > 0 && active_worker_count(&active_by_node) < global_worker_cap {
+            let name = format!("piper-worker-{}", workers.len());
+            let worker_id = spawn_worker(&mut workers, worker_event_sender.clone(), &name)?;
+            assign_worker(
+                worker_id,
+                node_index,
+                &stages,
+                &links,
+                &config,
+                input_link,
+                &shutdown,
+                &abort,
+                &internal_failure_sender,
+                &link_queue_lens,
+                &mut workers,
+                &mut active_by_node,
+            )?;
+            remaining -= 1;
         }
     }
 
@@ -3627,7 +3781,7 @@ where
         &snapshot,
         &links,
         &stages,
-        &active_by_stage,
+        &active_by_node,
         parked.len(),
         &link_controls,
         &controls,
@@ -3642,7 +3796,7 @@ where
         drain_worker_events(
             &worker_event_receiver,
             &mut workers,
-            &mut active_by_stage,
+            &mut active_by_node,
             &mut parked,
             &mut controls,
             &mut pending_scale,
@@ -3697,14 +3851,15 @@ where
         for (index, link) in links.iter().enumerate() {
             link_queue_lens[index].store(link.queue_len().unwrap_or(0), Ordering::Relaxed);
         }
-        collect_stage_samples(
+        collect_node_samples(
             &workers,
-            &active_by_stage,
+            &active_by_node,
             &link_controls,
             &stages,
             &mut controls,
+            sample_elapsed,
         );
-        update_desired_workers(&link_controls, &active_by_stage, &stages, &mut controls);
+        update_desired_workers(&link_controls, &active_by_node, &stages, &mut controls);
 
         if !shutdown.load(Ordering::Acquire)
             && !abort.load(Ordering::Acquire)
@@ -3713,7 +3868,7 @@ where
         {
             if let Some(operation) = choose_scale_operation(
                 &link_controls,
-                &active_by_stage,
+                &active_by_node,
                 &mut controls,
                 &stages,
                 output_link,
@@ -3721,7 +3876,7 @@ where
             ) {
                 match operation {
                     ScaleOperation::Add {
-                        stage_index,
+                        node_index,
                         reason,
                     } => {
                         let worker_id = match parked.pop() {
@@ -3733,7 +3888,7 @@ where
                         };
                         assign_worker(
                             worker_id,
-                            stage_index,
+                            node_index,
                             &stages,
                             &links,
                             &config,
@@ -3743,11 +3898,11 @@ where
                             &internal_failure_sender,
                             &link_queue_lens,
                             &mut workers,
-                            &mut active_by_stage,
+                            &mut active_by_node,
                         )?;
                         pending_scale = Some(PendingScale {
                             worker_id,
-                            stage_index,
+                            node_index,
                             direction: ScaleDirection::Add,
                             reason,
                         });
@@ -3760,18 +3915,18 @@ where
                         }
                     }
                     ScaleOperation::Remove {
-                        stage_index,
+                        node_index,
                         worker_id,
                         reason,
                     } => {
                         if let Some(worker_id) =
-                            worker_id.or_else(|| active_by_stage[stage_index].first().copied())
+                            worker_id.or_else(|| active_by_node[node_index].first().copied())
                         {
                             if let Some(retire) = workers[worker_id].retire.as_ref() {
                                 retire.store(true, Ordering::Release);
                                 pending_scale = Some(PendingScale {
                                     worker_id,
-                                    stage_index,
+                                    node_index,
                                     direction: ScaleDirection::Remove,
                                     reason,
                                 });
@@ -3786,7 +3941,7 @@ where
             &snapshot,
             &links,
             &stages,
-            &active_by_stage,
+            &active_by_node,
             parked.len(),
             &link_controls,
             &controls,
@@ -3797,7 +3952,7 @@ where
             pending_scale.is_some(),
         );
 
-        let active_count: usize = active_by_stage.iter().map(Vec::len).sum();
+        let active_count: usize = active_by_node.iter().map(Vec::len).sum();
         if (shutdown.load(Ordering::Acquire)
             || abort.load(Ordering::Acquire)
             || stored_failure.is_some())
@@ -3828,7 +3983,7 @@ where
         &snapshot,
         &links,
         &stages,
-        &active_by_stage,
+        &active_by_node,
         0,
         &link_controls,
         &controls,
@@ -3880,25 +4035,23 @@ where
         name: name.to_string(),
         command: command_sender,
         handle: Some(handle),
-        active_stage: None,
+        active_node: None,
         retire: None,
         stats: Arc::new(WorkerStats::default()),
     });
     Ok(worker_id)
 }
 
-fn parked_worker_target<E>(stages: &[RuntimeStage<E>]) -> usize
+fn parked_worker_target<E>(nodes: &[RuntimeNode<E>]) -> usize
 where
     E: Debug + Display + Send + 'static,
 {
-    stages
+    nodes
         .iter()
-        .filter(|stage| {
-            !stage.is_external
-                && stage.weighted_branch_config.is_none()
-                && !stage
-                    .anchor
-                    .is_some_and(|anchor| anchor.fixed_threads.is_some())
+        .filter(|node| {
+            !node.is_external
+                && node.weighted_branch_config.is_none()
+                && !matches!(node.thread_policy, ResolvedThreadPolicy::Fixed(_))
         })
         .count()
 }
@@ -3906,8 +4059,8 @@ where
 #[allow(clippy::too_many_arguments)]
 fn assign_worker<E>(
     worker_id: usize,
-    stage_index: usize,
-    stages: &[RuntimeStage<E>],
+    node_index: usize,
+    stages: &[RuntimeNode<E>],
     links: &[Link],
     config: &PiperConfig,
     input_link: usize,
@@ -3916,19 +4069,19 @@ fn assign_worker<E>(
     internal_failure: &channel::Sender<InternalFailure>,
     link_queue_lens: &[Arc<AtomicUsize>],
     workers: &mut [WorkerSlot<E>],
-    active_by_stage: &mut [Vec<usize>],
+    active_by_node: &mut [Vec<usize>],
 ) -> Result<(), E>
 where
     E: Debug + Display + Send + 'static,
 {
     let retire = Arc::new(AtomicBool::new(false));
     workers[worker_id].stats.reset();
-    let stage = &stages[stage_index];
+    let stage = &stages[node_index];
     if let Some(branch_config) = stage.weighted_branch_config {
         let left_link = stage.output_links[0];
         let right_link = stage.output_links[1];
         let assignment = WeightedBranchAssignment {
-            stage_index,
+            node_index,
             input: links[stage.input_link].make_input(),
             input_stats: Arc::clone(&links[stage.input_link].stats),
             left_output: links[left_link].make_output(),
@@ -3947,9 +4100,9 @@ where
             internal_failure: internal_failure.clone(),
             stats: Arc::clone(&workers[worker_id].stats),
         };
-        workers[worker_id].active_stage = Some(stage_index);
+        workers[worker_id].active_node = Some(node_index);
         workers[worker_id].retire = Some(retire);
-        active_by_stage[stage_index].push(worker_id);
+        active_by_node[node_index].push(worker_id);
         return workers[worker_id]
             .command
             .send(WorkerCommand::RunWeightedBranch(assignment))
@@ -3966,7 +4119,7 @@ where
     let output_link = stage.output_links[0];
     let output = links[output_link].make_output();
     let assignment = WorkerAssignment {
-        stage_index,
+        node_index,
         stage: Arc::clone(stage_impl),
         input: links[stage.input_link].make_input(),
         input_stats: Arc::clone(&links[stage.input_link].stats),
@@ -3981,9 +4134,9 @@ where
         internal_failure: internal_failure.clone(),
         stats: Arc::clone(&workers[worker_id].stats),
     };
-    workers[worker_id].active_stage = Some(stage_index);
+    workers[worker_id].active_node = Some(node_index);
     workers[worker_id].retire = Some(retire);
-    active_by_stage[stage_index].push(worker_id);
+    active_by_node[node_index].push(worker_id);
     workers[worker_id]
         .command
         .send(WorkerCommand::Run(assignment))
@@ -4023,13 +4176,13 @@ fn run_assignment<E>(
 ) where
     E: Debug + Display + Send + 'static,
 {
-    let stage_index = assignment.stage_index;
+    let node_index = assignment.node_index;
     let mut state = match assignment.stage.init_box() {
         Ok(state) => state,
         Err(failure) => {
             let _ = event_sender.send(WorkerEvent::Failed {
                 worker_id,
-                stage_index,
+                node_index,
                 worker: worker_name.to_string(),
                 failure,
             });
@@ -4067,7 +4220,7 @@ fn run_assignment<E>(
                     .input_stats
                     .drains
                     .fetch_add(1, Ordering::Relaxed);
-                let ctx = RuntimeStageContext {
+                let ctx = RuntimeNodeContext {
                     output: assignment.output.clone(),
                     output_stats: Arc::clone(&assignment.output_stats),
                     output_acquire: assignment.output_acquire.clone(),
@@ -4084,7 +4237,7 @@ fn run_assignment<E>(
                 if let Err(failure) = result {
                     let _ = event_sender.send(WorkerEvent::Failed {
                         worker_id,
-                        stage_index,
+                        node_index,
                         worker: worker_name.to_string(),
                         failure,
                     });
@@ -4118,7 +4271,7 @@ fn run_assignment<E>(
         if let Err(failure) = assignment.stage.cleanup_box(state) {
             let _ = event_sender.send(WorkerEvent::Failed {
                 worker_id,
-                stage_index,
+                node_index,
                 worker: worker_name.to_string(),
                 failure,
             });
@@ -4128,7 +4281,7 @@ fn run_assignment<E>(
 
     let _ = event_sender.send(WorkerEvent::Parked {
         worker_id,
-        stage_index,
+        node_index,
     });
 }
 
@@ -4140,7 +4293,7 @@ fn run_weighted_branch_assignment<E>(
 ) where
     E: Debug + Display + Send + 'static,
 {
-    let stage_index = assignment.stage_index;
+    let node_index = assignment.node_index;
     let _ = event_sender.send(WorkerEvent::Started { worker_id });
     let mut last_controller_sample =
         Instant::now() - assignment.sample_interval - Duration::from_micros(1);
@@ -4208,7 +4361,7 @@ fn run_weighted_branch_assignment<E>(
                     {
                         assignment.abort.store(true, Ordering::Release);
                         let _ = assignment.internal_failure.send(InternalFailure::internal(
-                            "stage output channel closed unexpectedly",
+                            "node output channel closed unexpectedly",
                         ));
                     }
                     Err(_) => {}
@@ -4235,7 +4388,7 @@ fn run_weighted_branch_assignment<E>(
 
     let _ = event_sender.send(WorkerEvent::Parked {
         worker_id,
-        stage_index,
+        node_index,
     });
 }
 
@@ -4243,9 +4396,9 @@ fn run_weighted_branch_assignment<E>(
 fn drain_worker_events<E>(
     receiver: &channel::Receiver<WorkerEvent<E>>,
     workers: &mut [WorkerSlot<E>],
-    active_by_stage: &mut [Vec<usize>],
+    active_by_node: &mut [Vec<usize>],
     parked: &mut Vec<usize>,
-    controls: &mut [StageControl],
+    controls: &mut [NodeControl],
     pending_scale: &mut Option<PendingScale>,
     abort: &Arc<AtomicBool>,
     stored_failure: &mut Option<PiperError<E>>,
@@ -4259,91 +4412,40 @@ fn drain_worker_events<E>(
                     pending.worker_id == worker_id && pending.direction == ScaleDirection::Add
                 }) {
                     let pending = pending_scale.take().expect("pending scale exists");
-                    record_stage_operation(controls, pending.stage_index, ScaleDirection::Add);
-                    match pending.reason {
-                        ScaleReason::Support => {
-                            controls[pending.stage_index].settling = true;
-                            controls[pending.stage_index].settle_samples = 0;
-                            controls[pending.stage_index].settle_observed_work = false;
-                            controls[pending.stage_index].scaling_state =
-                                StageScalingState::Settling;
-                        }
-                        ScaleReason::AnchorProbe => {
-                            if let Some(anchor) = controls[pending.stage_index].anchor.as_mut() {
-                                anchor.probe = Some(AnchorProbe {
-                                    worker_id,
-                                    samples: 0,
-                                    observed_work: false,
-                                });
-                            }
-                            controls[pending.stage_index].scaling_state =
-                                StageScalingState::Probing;
-                        }
-                        ScaleReason::AnchorRevert
-                        | ScaleReason::BudgetPressure
-                        | ScaleReason::Idle => {
-                            controls[pending.stage_index].settling = true;
-                            controls[pending.stage_index].settle_samples = 0;
-                            controls[pending.stage_index].settle_observed_work = false;
-                            controls[pending.stage_index].scaling_state =
-                                StageScalingState::Settling;
-                        }
-                    }
+                    record_node_operation(controls, pending.node_index, ScaleDirection::Add);
+                    controls[pending.node_index].settling = true;
+                    controls[pending.node_index].settle_samples = 0;
+                    controls[pending.node_index].settle_observed_work = false;
+                    controls[pending.node_index].scaling_state = NodeScalingState::Settling;
                 }
             }
             WorkerEvent::Parked {
                 worker_id,
-                stage_index,
+                node_index,
             } => {
-                remove_worker_from_stage(active_by_stage, stage_index, worker_id);
-                workers[worker_id].active_stage = None;
+                remove_worker_from_node(active_by_node, node_index, worker_id);
+                workers[worker_id].active_node = None;
                 workers[worker_id].retire = None;
                 parked.push(worker_id);
                 if pending_scale.as_ref().is_some_and(|pending| {
                     pending.worker_id == worker_id && pending.direction == ScaleDirection::Remove
                 }) {
                     let pending = pending_scale.take().expect("pending scale exists");
-                    record_stage_operation(controls, pending.stage_index, ScaleDirection::Remove);
-                    if let Some(anchor) = controls[pending.stage_index].anchor.as_mut() {
-                        if matches!(
-                            pending.reason,
-                            ScaleReason::AnchorRevert
-                                | ScaleReason::BudgetPressure
-                                | ScaleReason::Idle
-                        ) {
-                            anchor.probe = None;
-                            anchor.last_probe_outcome = AnchorProbeOutcome::Reverted;
-                            if pending.reason == ScaleReason::BudgetPressure {
-                                anchor.last_probe_reason = AnchorProbeReason::BudgetPressure;
-                            } else if pending.reason == ScaleReason::Idle {
-                                anchor.last_probe_reason = AnchorProbeReason::Idle;
-                            }
-                            anchor.cooldown_samples = grow_sample_count(anchor.cooldown_samples);
-                            controls[pending.stage_index].scaling_state =
-                                StageScalingState::BackingOff;
-                        } else {
-                            controls[pending.stage_index].settling = true;
-                            controls[pending.stage_index].settle_samples = 0;
-                            controls[pending.stage_index].settle_observed_work = false;
-                            controls[pending.stage_index].scaling_state =
-                                StageScalingState::Settling;
-                        }
-                    } else {
-                        controls[pending.stage_index].settling = true;
-                        controls[pending.stage_index].settle_samples = 0;
-                        controls[pending.stage_index].settle_observed_work = false;
-                        controls[pending.stage_index].scaling_state = StageScalingState::Settling;
-                    }
+                    record_node_operation(controls, pending.node_index, ScaleDirection::Remove);
+                    controls[pending.node_index].settling = true;
+                    controls[pending.node_index].settle_samples = 0;
+                    controls[pending.node_index].settle_observed_work = false;
+                    controls[pending.node_index].scaling_state = NodeScalingState::Settling;
                 }
             }
             WorkerEvent::Failed {
                 worker_id,
-                stage_index,
+                node_index,
                 worker,
                 failure,
             } => {
-                remove_worker_from_stage(active_by_stage, stage_index, worker_id);
-                workers[worker_id].active_stage = None;
+                remove_worker_from_node(active_by_node, node_index, worker_id);
+                workers[worker_id].active_node = None;
                 workers[worker_id].retire = None;
                 if !parked.contains(&worker_id) {
                     parked.push(worker_id);
@@ -4356,10 +4458,10 @@ fn drain_worker_events<E>(
                 }
                 abort.store(true, Ordering::Release);
                 *stored_failure = Some(match failure {
-                    StageFailure::Init(error) => PiperError::UserInit { worker, error },
-                    StageFailure::Process(error) => PiperError::UserProcess { worker, error },
-                    StageFailure::Cleanup(error) => PiperError::UserCleanup { worker, error },
-                    StageFailure::Internal(message) => PiperError::Internal { worker, message },
+                    NodeFailure::Init(error) => PiperError::UserInit { worker, error },
+                    NodeFailure::Process(error) => PiperError::UserProcess { worker, error },
+                    NodeFailure::Cleanup(error) => PiperError::UserCleanup { worker, error },
+                    NodeFailure::Internal(message) => PiperError::Internal { worker, message },
                 });
             }
             WorkerEvent::Stopped => {}
@@ -4367,25 +4469,25 @@ fn drain_worker_events<E>(
     }
 }
 
-fn remove_worker_from_stage(
-    active_by_stage: &mut [Vec<usize>],
-    stage_index: usize,
+fn remove_worker_from_node(
+    active_by_node: &mut [Vec<usize>],
+    node_index: usize,
     worker_id: usize,
 ) {
-    if let Some(position) = active_by_stage[stage_index]
+    if let Some(position) = active_by_node[node_index]
         .iter()
         .position(|id| *id == worker_id)
     {
-        active_by_stage[stage_index].swap_remove(position);
+        active_by_node[node_index].swap_remove(position);
     }
 }
 
-fn record_stage_operation(
-    controls: &mut [StageControl],
-    stage_index: usize,
+fn record_node_operation(
+    controls: &mut [NodeControl],
+    node_index: usize,
     direction: ScaleDirection,
 ) {
-    controls[stage_index].last_operation = Some((direction, Instant::now()));
+    controls[node_index].last_operation = Some((direction, Instant::now()));
 }
 
 const RATE_EWMA_ALPHA: f64 = 0.35;
@@ -4472,17 +4574,31 @@ fn classify_queue_trend(
     }
 }
 
-fn collect_stage_samples<E>(
+fn effective_backlog_len(link: &LinkControl) -> f64 {
+    if link.len == 0 {
+        return 0.0;
+    }
+    let smoothed = if link.smoothed_len.is_finite() && link.smoothed_len > 0.0 {
+        link.smoothed_len.ceil()
+    } else {
+        0.0
+    };
+    link.len.max(smoothed as usize) as f64
+}
+
+fn collect_node_samples<E>(
     workers: &[WorkerSlot<E>],
-    active_by_stage: &[Vec<usize>],
+    active_by_node: &[Vec<usize>],
     links: &[LinkControl],
-    stages: &[RuntimeStage<E>],
-    controls: &mut [StageControl],
+    nodes: &[RuntimeNode<E>],
+    controls: &mut [NodeControl],
+    sample_elapsed: Duration,
 ) where
     E: Debug + Display + Send + 'static,
 {
-    for (stage_index, worker_ids) in active_by_stage.iter().enumerate() {
-        let mut sample = StageSample::default();
+    let now = Instant::now();
+    for (node_index, worker_ids) in active_by_node.iter().enumerate() {
+        let mut sample = NodeSample::default();
         for worker_id in worker_ids {
             let stats = &workers[*worker_id].stats;
             sample.process_nanos += stats.process_nanos.swap(0, Ordering::Relaxed);
@@ -4490,7 +4606,7 @@ fn collect_stage_samples<E>(
             sample.processed_items += stats.processed_items.swap(0, Ordering::Relaxed);
         }
 
-        let control = &mut controls[stage_index];
+        let control = &mut controls[node_index];
         control.last_sample_processed = sample.processed_items;
         control.processed_count = control
             .processed_count
@@ -4508,46 +4624,32 @@ fn collect_stage_samples<E>(
             control.per_worker_throughput = 1_000_000_000.0 / control.service_time_ewma.max(1.0);
         }
 
-        let input_link = stages[stage_index].input_link;
-        let output_link = stages[stage_index].output_links[0];
-
-        if sample.processed_items > 0 || links[input_link].trend != QueueTrend::Starved {
-            control.idle_samples = 0;
-        } else if control.busy_ratio < 0.05 {
-            control.idle_samples = control.idle_samples.saturating_add(1);
-        }
-
         if control.settling {
             control.settle_samples = control.settle_samples.saturating_add(1);
             control.settle_observed_work |= sample.processed_items > 0;
-            if control.settle_samples >= SETTLE_SAMPLES
-                && (control.settle_observed_work || control.idle_samples >= IDLE_SHRINK_SAMPLES)
-            {
+            if control.settle_samples >= SETTLE_SAMPLES && control.settle_observed_work {
                 control.settling = false;
-                control.scaling_state = StageScalingState::Eligible;
+                control.scaling_state = NodeScalingState::Eligible;
             }
         }
 
-        let input_available = links[input_link].trend != QueueTrend::Starved;
-        let output_unblocked = !links[output_link].trend.is_growing();
-        if let Some(anchor) = control.anchor.as_mut() {
-            if let Some(probe) = anchor.probe.as_mut() {
-                probe.samples = probe.samples.saturating_add(1);
-                probe.observed_work |= sample.processed_items > 0;
-            } else if anchor.cooldown_samples > 0 {
-                anchor.cooldown_samples -= 1;
-                if anchor.cooldown_samples == 0 {
-                    control.scaling_state = StageScalingState::Eligible;
+        if let ResolvedThreadPolicy::Scalable(policy) = control.thread_policy {
+            let throughput = control.per_worker_throughput;
+            let input = &links[nodes[node_index].input_link];
+            control.backlog_seconds = if throughput > 0.0 {
+                effective_backlog_len(input) / throughput
+            } else {
+                0.0
+            };
+            let underutilized = control.backlog_seconds <= policy.low_queue_seconds
+                && control.busy_ratio < policy.underutilized_busy_ratio;
+            if underutilized {
+                let entry = control.scale_down_eligible_since.get_or_insert(now);
+                if now.duration_since(*entry) < policy.scale_down_after {
+                    let _ = sample_elapsed;
                 }
-            }
-
-            if !anchor.warmup_complete
-                && sample.processed_items > 0
-                && input_available
-                && output_unblocked
-            {
-                anchor.warmup_complete = true;
-                control.scaling_state = StageScalingState::Eligible;
+            } else {
+                control.scale_down_eligible_since = None;
             }
         }
     }
@@ -4555,47 +4657,74 @@ fn collect_stage_samples<E>(
 
 fn update_desired_workers<E>(
     links: &[LinkControl],
-    active_by_stage: &[Vec<usize>],
-    stages: &[RuntimeStage<E>],
-    controls: &mut [StageControl],
+    active_by_node: &[Vec<usize>],
+    nodes: &[RuntimeNode<E>],
+    controls: &mut [NodeControl],
 ) where
     E: Debug + Display + Send + 'static,
 {
-    for stage_index in 0..controls.len() {
-        if controls[stage_index].is_external {
-            controls[stage_index].desired_workers = 0;
+    for node_index in 0..controls.len() {
+        if controls[node_index].is_external {
+            controls[node_index].desired_workers = 0;
             continue;
         }
-        if controls[stage_index].is_weighted_branch {
-            controls[stage_index].desired_workers = 1;
+        if controls[node_index].is_weighted_branch {
+            controls[node_index].desired_workers = 1;
             continue;
         }
-        let active = active_by_stage[stage_index].len().max(1);
-        let input = &links[stages[stage_index].input_link];
-        let throughput = controls[stage_index].per_worker_throughput;
-        let desired = if throughput > 0.0 {
-            let mut required_rate = input.arrival_rate.max(0.0);
-            if input.trend.is_growing() {
-                required_rate += input.net_rate.max(0.0);
-                required_rate += input.len as f64 / DEFAULT_BACKLOG_DRAIN_SECS;
+
+        let active = active_by_node[node_index].len().max(1);
+        let input = &links[nodes[node_index].input_link];
+        let throughput = controls[node_index].per_worker_throughput;
+
+        controls[node_index].desired_workers = match controls[node_index].thread_policy {
+            ResolvedThreadPolicy::Fixed(count) => count,
+            ResolvedThreadPolicy::Scalable(policy) => {
+                if throughput > 0.0 {
+                    let backlog_len = effective_backlog_len(input);
+                    controls[node_index].backlog_seconds = backlog_len / throughput;
+                    let workers_for_arrivals =
+                        (input.arrival_rate / throughput).ceil().max(1.0) as usize;
+                    let workers_for_backlog = (backlog_len
+                        / (policy.target_queue_seconds * throughput))
+                        .ceil()
+                        .max(1.0) as usize;
+                    workers_for_arrivals
+                        .max(workers_for_backlog)
+                        .clamp(1, policy.max_threads)
+                } else if input.trend.is_growing() {
+                    active.saturating_add(1).clamp(1, policy.max_threads)
+                } else {
+                    active.max(1)
+                }
             }
-            (required_rate / throughput).ceil().max(1.0) as usize
-        } else if input.trend.is_growing() {
-            active.saturating_add(1)
-        } else {
-            active
+            ResolvedThreadPolicy::ImplicitSupport => {
+                if throughput > 0.0 {
+                    let mut required_rate = input.arrival_rate.max(0.0);
+                    if input.trend.is_growing() {
+                        required_rate += input.net_rate.max(0.0);
+                        required_rate +=
+                            effective_backlog_len(input) / DEFAULT_BACKLOG_DRAIN_SECS;
+                    }
+                    (required_rate / throughput).ceil().max(1.0) as usize
+                } else if input.trend.is_growing() {
+                    active.saturating_add(1)
+                } else {
+                    active
+                }
+                .max(1)
+            }
         };
-        controls[stage_index].desired_workers = desired.max(1);
     }
 }
 
 enum ScaleOperation {
     Add {
-        stage_index: usize,
+        node_index: usize,
         reason: ScaleReason,
     },
     Remove {
-        stage_index: usize,
+        node_index: usize,
         worker_id: Option<usize>,
         reason: ScaleReason,
     },
@@ -4603,139 +4732,113 @@ enum ScaleOperation {
 
 fn choose_scale_operation<E>(
     links: &[LinkControl],
-    active_by_stage: &[Vec<usize>],
-    controls: &mut [StageControl],
-    stages: &[RuntimeStage<E>],
+    active_by_node: &[Vec<usize>],
+    controls: &mut [NodeControl],
+    nodes: &[RuntimeNode<E>],
     output_link: usize,
     global_worker_cap: usize,
 ) -> Option<ScaleOperation>
 where
     E: Debug + Display + Send + 'static,
 {
-    if let Some(operation) = choose_support_operation(
+    if let Some(operation) = choose_scalable_scale_up(
         links,
-        active_by_stage,
+        active_by_node,
         controls,
-        stages,
+        nodes,
         output_link,
         global_worker_cap,
     ) {
         return Some(operation);
     }
 
-    let scalable_anchors: Vec<_> = scalable_anchor_indices(controls).collect();
-    for anchor_index in scalable_anchors {
-        if let Some(operation) = choose_anchor_probe_operation(
-            links,
-            active_by_stage,
-            controls,
-            stages,
-            anchor_index,
-            output_link,
-            global_worker_cap,
-        ) {
-            return Some(operation);
-        }
+    if let Some(operation) = choose_support_operation(
+        links,
+        active_by_node,
+        controls,
+        nodes,
+        output_link,
+        global_worker_cap,
+    ) {
+        return Some(operation);
     }
 
-    let scalable_anchors: Vec<_> = scalable_anchor_indices(controls).collect();
-    for anchor_index in scalable_anchors {
-        if let Some(operation) = choose_anchor_operation(
-            links,
-            active_by_stage,
-            controls,
-            stages,
-            anchor_index,
-            output_link,
-            global_worker_cap,
-        ) {
-            return Some(operation);
-        }
+    if let Some(operation) = choose_anchor_pressure_operation(
+        links,
+        active_by_node,
+        controls,
+        nodes,
+        output_link,
+        global_worker_cap,
+    ) {
+        return Some(operation);
     }
 
-    choose_idle_operation(links, active_by_stage, controls, stages)
+    choose_scale_down_operation(links, active_by_node, controls, nodes, output_link)
 }
 
-fn choose_anchor_probe_operation<E>(
+fn downstream_blocks_scale_up<E>(
     links: &[LinkControl],
-    active_by_stage: &[Vec<usize>],
-    controls: &mut [StageControl],
-    stages: &[RuntimeStage<E>],
-    anchor_index: usize,
+    nodes: &[RuntimeNode<E>],
+    node_index: usize,
+    output_link: usize,
+) -> bool
+where
+    E: Debug + Display + Send + 'static,
+{
+    links[output_link].trend.is_growing()
+        || links[nodes[node_index].output_links[0]].trend.is_growing()
+}
+
+fn choose_scalable_scale_up<E>(
+    links: &[LinkControl],
+    active_by_node: &[Vec<usize>],
+    controls: &mut [NodeControl],
+    nodes: &[RuntimeNode<E>],
     output_link: usize,
     global_worker_cap: usize,
 ) -> Option<ScaleOperation>
 where
     E: Debug + Display + Send + 'static,
 {
-    if support_growth_is_settling(controls, anchor_index) {
+    if active_worker_count(active_by_node) >= global_worker_cap {
         return None;
     }
 
-    let control = &mut controls[anchor_index];
-    let anchor = control.anchor.as_mut()?;
-
-    if let Some(probe) = anchor.probe.as_ref() {
-        if probe.samples < PROBE_SETTLE_SAMPLES || !probe.observed_work {
-            return None;
-        }
-
-        let input_link = stages[anchor_index].input_link;
-        let stage_output_link = stages[anchor_index].output_links[0];
-        let output_backpressure = links[output_link].trend.is_growing();
-        let input_underfed =
-            link_underfeeds_stage(&links[input_link], active_by_stage[anchor_index].len());
-        let output_unstable = links[stage_output_link].trend.is_growing();
-        let budget_pressure = active_worker_count(active_by_stage) >= global_worker_cap
-            && active_by_stage[anchor_index].len() > 1;
-        let too_idle = control.busy_ratio < 0.45 && !links[input_link].trend.is_growing();
-
-        let revert_reason = if output_backpressure {
-            Some(AnchorProbeReason::OutputBackpressure)
-        } else if budget_pressure {
-            Some(AnchorProbeReason::BudgetPressure)
-        } else if input_underfed {
-            Some(AnchorProbeReason::InputUnderfed)
-        } else if output_unstable {
-            Some(AnchorProbeReason::SupportUnstable)
-        } else if too_idle {
-            Some(AnchorProbeReason::Idle)
-        } else {
-            None
+    for node_index in 0..controls.len() {
+        let ResolvedThreadPolicy::Scalable(policy) = controls[node_index].thread_policy else {
+            continue;
         };
-
-        if let Some(reason) = revert_reason {
-            anchor.last_probe_reason = reason;
-            return Some(ScaleOperation::Remove {
-                stage_index: anchor_index,
-                worker_id: Some(probe.worker_id),
-                reason: ScaleReason::AnchorRevert,
-            });
+        if !node_can_scale(&controls[node_index]) {
+            continue;
         }
-
-        anchor.probe = None;
-        anchor.last_probe_outcome = AnchorProbeOutcome::Kept;
-        anchor.last_probe_reason = AnchorProbeReason::None;
-        anchor.cooldown_samples = 2;
-        control.scaling_state = StageScalingState::Eligible;
+        if downstream_blocks_scale_up(links, nodes, node_index, output_link) {
+            continue;
+        }
+        let active = active_by_node[node_index].len();
+        if active >= controls[node_index].desired_workers || active >= policy.max_threads {
+            continue;
+        }
+        let input = &links[nodes[node_index].input_link];
+        if controls[node_index].backlog_seconds <= policy.target_queue_seconds
+            && !input.trend.is_growing()
+        {
+            continue;
+        }
+        return Some(ScaleOperation::Add {
+            node_index,
+            reason: ScaleReason::Scalable,
+        });
     }
 
     None
 }
 
-fn support_growth_is_settling(controls: &[StageControl], anchor_index: usize) -> bool {
-    controls.iter().enumerate().any(|(stage_index, control)| {
-        stage_index != anchor_index
-            && control.settling
-            && matches!(control.last_operation, Some((ScaleDirection::Add, _)))
-    })
-}
-
 fn choose_support_operation<E>(
     links: &[LinkControl],
-    active_by_stage: &[Vec<usize>],
-    controls: &mut [StageControl],
-    stages: &[RuntimeStage<E>],
+    active_by_node: &[Vec<usize>],
+    controls: &mut [NodeControl],
+    nodes: &[RuntimeNode<E>],
     output_link: usize,
     global_worker_cap: usize,
 ) -> Option<ScaleOperation>
@@ -4743,21 +4846,6 @@ where
     E: Debug + Display + Send + 'static,
 {
     if links[output_link].trend.is_growing() {
-        let scalable_anchors: Vec<_> = scalable_anchor_indices(controls).collect();
-        for anchor_index in scalable_anchors {
-            if active_by_stage[anchor_index].len() > 1 && stage_can_scale(&controls[anchor_index]) {
-                set_anchor_reason(
-                    controls,
-                    anchor_index,
-                    AnchorProbeReason::OutputBackpressure,
-                );
-                return Some(ScaleOperation::Remove {
-                    stage_index: anchor_index,
-                    worker_id: None,
-                    reason: ScaleReason::AnchorRevert,
-                });
-            }
-        }
         return None;
     }
 
@@ -4765,229 +4853,203 @@ where
         if !links[link_index].trend.is_growing() {
             continue;
         }
-        for consumer_stage in consumer_stages(stages, link_index) {
-            if controls[consumer_stage]
-                .anchor
-                .as_ref()
-                .is_some_and(|anchor| anchor.fixed_threads.is_some())
-            {
+        for consumer_index in consumer_nodes(nodes, link_index) {
+            if !matches!(
+                controls[consumer_index].thread_policy,
+                ResolvedThreadPolicy::ImplicitSupport
+            ) {
                 continue;
             }
-            if controls[consumer_stage].anchor.is_some() {
-                continue;
-            }
-            if active_by_stage[consumer_stage].len() < controls[consumer_stage].desired_workers
-                && support_can_add(consumer_stage, controls)
+            if active_by_node[consumer_index].len() < controls[consumer_index].desired_workers
+                && node_can_scale(&controls[consumer_index])
+                && !downstream_blocks_scale_up(links, nodes, consumer_index, output_link)
             {
-                return add_or_rebalance_for_stage(
-                    consumer_stage,
-                    active_by_stage,
+                return add_or_rebalance_for_node(
+                    consumer_index,
+                    active_by_node,
                     controls,
                     global_worker_cap,
                 );
             }
-        }
-    }
-
-    let anchors: Vec<_> = anchor_indices(controls).collect();
-    for anchor_index in anchors {
-        let input_link = stages[anchor_index].input_link;
-        let anchor_input = &links[input_link];
-        if !link_underfeeds_stage(anchor_input, active_by_stage[anchor_index].len())
-            || controls[anchor_index].busy_ratio <= 0.60
-        {
-            continue;
-        }
-        for stage_index in producer_stages(stages, input_link) {
-            if controls[stage_index]
-                .anchor
-                .as_ref()
-                .is_some_and(|anchor| anchor.fixed_threads.is_some())
-            {
-                continue;
-            }
-            if links[stages[stage_index].input_link].trend == QueueTrend::Starved {
-                continue;
-            }
-            if support_can_add(stage_index, controls)
-                && active_by_stage[stage_index].len()
-                    < controls[stage_index]
-                        .desired_workers
-                        .max(active_by_stage[stage_index].len() + 1)
-            {
-                return add_or_rebalance_for_stage(
-                    stage_index,
-                    active_by_stage,
-                    controls,
-                    global_worker_cap,
-                );
-            }
-        }
-        if controls[anchor_index]
-            .anchor
-            .as_ref()
-            .is_some_and(|anchor| anchor.fixed_threads.is_none())
-            && active_by_stage[anchor_index].len() > 1
-            && stage_can_scale(&controls[anchor_index])
-        {
-            set_anchor_reason(controls, anchor_index, AnchorProbeReason::InputUnderfed);
-            return Some(ScaleOperation::Remove {
-                stage_index: anchor_index,
-                worker_id: None,
-                reason: ScaleReason::AnchorRevert,
-            });
         }
     }
 
     None
 }
 
-fn choose_anchor_operation<E>(
+fn choose_anchor_pressure_operation<E>(
     links: &[LinkControl],
-    active_by_stage: &[Vec<usize>],
-    controls: &mut [StageControl],
-    stages: &[RuntimeStage<E>],
-    anchor_index: usize,
+    active_by_node: &[Vec<usize>],
+    controls: &mut [NodeControl],
+    nodes: &[RuntimeNode<E>],
     output_link: usize,
     global_worker_cap: usize,
 ) -> Option<ScaleOperation>
 where
     E: Debug + Display + Send + 'static,
 {
-    let control = &mut controls[anchor_index];
-    let anchor = control.anchor.as_mut()?;
-    if anchor.fixed_threads.is_some() {
+    if links[output_link].trend.is_growing() {
         return None;
     }
 
-    if anchor.probe.is_some() {
-        return None;
+    for anchor_index in anchor_node_indices(controls).collect::<Vec<_>>() {
+        let input_link = nodes[anchor_index].input_link;
+        let target_queue = match controls[anchor_index].thread_policy {
+            ResolvedThreadPolicy::Scalable(policy) => policy.target_queue_seconds,
+            _ => 1.0,
+        };
+        if controls[anchor_index].busy_ratio <= 0.60
+            || !link_underfeeds_node(
+                &links[input_link],
+                active_by_node[anchor_index].len(),
+                controls[anchor_index].backlog_seconds,
+                target_queue,
+            )
+        {
+            continue;
+        }
+
+        for producer_index in producer_nodes(nodes, input_link) {
+            if matches!(
+                controls[producer_index].thread_policy,
+                ResolvedThreadPolicy::Fixed(_)
+            ) {
+                continue;
+            }
+            if links[nodes[producer_index].input_link].trend == QueueTrend::Starved {
+                continue;
+            }
+            if !node_can_scale(&controls[producer_index])
+                || downstream_blocks_scale_up(links, nodes, producer_index, output_link)
+            {
+                continue;
+            }
+            if active_by_node[producer_index].len() < controls[producer_index].desired_workers {
+                controls[anchor_index].last_anchor_pressure_reason =
+                    Some(AnchorPressureReason::InputUnderfed);
+                return add_or_rebalance_for_node(
+                    producer_index,
+                    active_by_node,
+                    controls,
+                    global_worker_cap,
+                );
+            }
+        }
     }
 
-    if anchor.cooldown_samples > 0 {
-        control.scaling_state = StageScalingState::BackingOff;
-        return None;
-    }
-
-    let active = active_by_stage[anchor_index].len();
-    if active >= anchor.max_threads {
-        control.scaling_state = StageScalingState::Eligible;
-        return None;
-    }
-
-    if !anchor.warmup_complete {
-        control.scaling_state = StageScalingState::BackingOff;
-        return None;
-    }
-
-    let has_budget = active_worker_count(active_by_stage) < global_worker_cap;
-    let input_link = stages[anchor_index].input_link;
-    let stage_output_link = stages[anchor_index].output_links[0];
-    let input_ready = !link_underfeeds_stage(&links[input_link], active);
-    let downstream_ready =
-        !links[stage_output_link].trend.is_growing() && !links[output_link].trend.is_growing();
-    let enough_busy_signal = control.busy_ratio >= 0.70 || links[input_link].trend.is_growing();
-
-    if has_budget && input_ready && downstream_ready && enough_busy_signal {
-        return Some(ScaleOperation::Add {
-            stage_index: anchor_index,
-            reason: ScaleReason::AnchorProbe,
-        });
-    }
-
-    control.scaling_state = StageScalingState::Eligible;
     None
 }
 
-fn choose_idle_operation<E>(
+fn choose_scale_down_operation<E>(
     links: &[LinkControl],
-    active_by_stage: &[Vec<usize>],
-    controls: &mut [StageControl],
-    stages: &[RuntimeStage<E>],
+    active_by_node: &[Vec<usize>],
+    controls: &mut [NodeControl],
+    nodes: &[RuntimeNode<E>],
+    output_link: usize,
 ) -> Option<ScaleOperation>
 where
     E: Debug + Display + Send + 'static,
 {
-    for stage_index in 0..controls.len() {
-        if controls[stage_index]
-            .anchor
-            .as_ref()
-            .is_some_and(|anchor| anchor.fixed_threads.is_some())
-        {
+    let now = Instant::now();
+    for node_index in 0..controls.len() {
+        if active_by_node[node_index].len() <= 1 || !node_can_scale(&controls[node_index]) {
             continue;
         }
-        if active_by_stage[stage_index].len() <= 1 || !stage_can_scale(&controls[stage_index]) {
+        if downstream_blocks_scale_up(links, nodes, node_index, output_link) {
             continue;
         }
-        if controls[stage_index].anchor.is_none()
-            && active_by_stage[stage_index].len() > controls[stage_index].desired_workers.max(1)
-            && !links[stages[stage_index].input_link].trend.is_growing()
-        {
-            return Some(ScaleOperation::Remove {
-                stage_index,
-                worker_id: None,
-                reason: ScaleReason::Support,
-            });
-        }
-        if controls[stage_index].idle_samples >= IDLE_SHRINK_SAMPLES {
-            if controls[stage_index].anchor.is_some() {
-                set_anchor_reason(controls, stage_index, AnchorProbeReason::Idle);
+
+        match controls[node_index].thread_policy {
+            ResolvedThreadPolicy::Scalable(policy) => {
+                let Some(since) = controls[node_index].scale_down_eligible_since else {
+                    continue;
+                };
+                if now.duration_since(since) < policy.scale_down_after {
+                    continue;
+                }
+                if controls[node_index].backlog_seconds > policy.low_queue_seconds {
+                    continue;
+                }
+                return Some(ScaleOperation::Remove {
+                    node_index,
+                    worker_id: None,
+                    reason: ScaleReason::Scalable,
+                });
             }
-            return Some(ScaleOperation::Remove {
-                stage_index,
-                worker_id: None,
-                reason: ScaleReason::Idle,
-            });
+            ResolvedThreadPolicy::ImplicitSupport => {
+                if active_by_node[node_index].len()
+                    <= controls[node_index].desired_workers.max(1)
+                {
+                    continue;
+                }
+                if links[nodes[node_index].input_link].trend.is_growing() {
+                    continue;
+                }
+                return Some(ScaleOperation::Remove {
+                    node_index,
+                    worker_id: None,
+                    reason: ScaleReason::Support,
+                });
+            }
+            ResolvedThreadPolicy::Fixed(_) => {}
         }
     }
+
     None
 }
 
-fn support_can_add(stage_index: usize, controls: &[StageControl]) -> bool {
-    stage_can_scale(&controls[stage_index])
-}
-
-fn link_underfeeds_stage(link: &LinkControl, active_threads: usize) -> bool {
+fn link_underfeeds_node(
+    link: &LinkControl,
+    active_threads: usize,
+    backlog_seconds: f64,
+    target_queue_seconds: f64,
+) -> bool {
+    if backlog_seconds > target_queue_seconds {
+        return false;
+    }
     link.trend == QueueTrend::Starved
-        || (link.trend.is_draining() && link.len <= active_threads.saturating_mul(2).max(1))
+        || (link.trend == QueueTrend::FastDraining
+            && backlog_seconds <= target_queue_seconds
+            && link.len <= active_threads.saturating_mul(2).max(1))
+        || (link.trend.is_draining()
+            && link.trend != QueueTrend::FastDraining
+            && link.len <= active_threads.saturating_mul(2).max(1))
 }
 
-fn stage_can_scale(control: &StageControl) -> bool {
+fn node_can_scale(control: &NodeControl) -> bool {
     !control.is_external
         && !control.is_weighted_branch
-        && !control
-            .anchor
-            .as_ref()
-            .is_some_and(|anchor| anchor.fixed_threads.is_some())
+        && !matches!(control.thread_policy, ResolvedThreadPolicy::Fixed(_))
         && !control.settling
-        && !matches!(
-            control.scaling_state,
-            StageScalingState::Settling | StageScalingState::Probing
-        )
+        && control.scaling_state != NodeScalingState::Settling
 }
 
-fn add_or_rebalance_for_stage(
-    stage_index: usize,
-    active_by_stage: &[Vec<usize>],
-    controls: &mut [StageControl],
+fn add_or_rebalance_for_node(
+    node_index: usize,
+    active_by_node: &[Vec<usize>],
+    controls: &mut [NodeControl],
     global_worker_cap: usize,
 ) -> Option<ScaleOperation> {
-    if active_worker_count(active_by_stage) < global_worker_cap {
+    if active_worker_count(active_by_node) < global_worker_cap {
         return Some(ScaleOperation::Add {
-            stage_index,
+            node_index,
             reason: ScaleReason::Support,
         });
     }
 
-    let scalable_anchors: Vec<_> = scalable_anchor_indices(controls).collect();
-    for anchor_index in scalable_anchors {
-        if stage_index != anchor_index
-            && active_by_stage[anchor_index].len() > 1
-            && stage_can_scale(&controls[anchor_index])
+    for anchor_index in anchor_node_indices(controls).collect::<Vec<_>>() {
+        if node_index != anchor_index
+            && matches!(
+                controls[anchor_index].thread_policy,
+                ResolvedThreadPolicy::Scalable(_)
+            )
+            && active_by_node[anchor_index].len() > 1
+            && node_can_scale(&controls[anchor_index])
         {
-            set_anchor_reason(controls, anchor_index, AnchorProbeReason::BudgetPressure);
+            controls[anchor_index].last_anchor_pressure_reason =
+                Some(AnchorPressureReason::BudgetPressure);
             return Some(ScaleOperation::Remove {
-                stage_index: anchor_index,
+                node_index: anchor_index,
                 worker_id: None,
                 reason: ScaleReason::BudgetPressure,
             });
@@ -4997,97 +5059,57 @@ fn add_or_rebalance_for_stage(
     None
 }
 
-fn active_worker_count(active_by_stage: &[Vec<usize>]) -> usize {
-    active_by_stage.iter().map(Vec::len).sum()
+fn active_worker_count(active_by_node: &[Vec<usize>]) -> usize {
+    active_by_node.iter().map(Vec::len).sum()
 }
 
-fn anchor_indices(controls: &[StageControl]) -> impl Iterator<Item = usize> + '_ {
+fn anchor_node_indices(controls: &[NodeControl]) -> impl Iterator<Item = usize> + '_ {
     controls
         .iter()
         .enumerate()
-        .filter_map(|(index, control)| control.anchor.as_ref().map(|_| index))
+        .filter_map(|(index, control)| control.is_anchor.then_some(index))
 }
 
-fn scalable_anchor_indices(controls: &[StageControl]) -> impl Iterator<Item = usize> + '_ {
-    controls.iter().enumerate().filter_map(|(index, control)| {
-        control
-            .anchor
-            .as_ref()
-            .filter(|anchor| anchor.fixed_threads.is_none())
-            .map(|_| index)
-    })
-}
-
-fn consumer_stages<E>(
-    stages: &[RuntimeStage<E>],
+fn consumer_nodes<E>(
+    nodes: &[RuntimeNode<E>],
     link_index: usize,
 ) -> impl Iterator<Item = usize> + '_
 where
     E: Debug + Display + Send + 'static,
 {
-    stages
+    nodes
         .iter()
         .enumerate()
-        .filter_map(move |(index, stage)| (stage.input_link == link_index).then_some(index))
+        .filter_map(move |(index, node)| (node.input_link == link_index).then_some(index))
 }
 
-fn producer_stages<E>(
-    stages: &[RuntimeStage<E>],
+fn producer_nodes<E>(
+    nodes: &[RuntimeNode<E>],
     link_index: usize,
 ) -> impl Iterator<Item = usize> + '_
 where
     E: Debug + Display + Send + 'static,
 {
-    stages.iter().enumerate().filter_map(move |(index, stage)| {
-        stage
-            .output_links
+    nodes.iter().enumerate().filter_map(move |(index, node)| {
+        node.output_links
             .iter()
             .any(|&output| output == link_index)
             .then_some(index)
     })
 }
 
-fn set_anchor_reason(
-    controls: &mut [StageControl],
-    anchor_index: usize,
-    reason: AnchorProbeReason,
-) {
-    if let Some(anchor) = controls[anchor_index].anchor.as_mut() {
-        anchor.last_probe_reason = reason;
-    }
-}
-
-fn grow_sample_count(current: u32) -> u32 {
-    current.saturating_mul(2).max(4).min(64)
-}
-
 fn duration_nanos_u64(duration: Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
 }
-
-fn anchor_probe_state(anchor: &AnchorControl, active_threads: usize) -> AnchorProbeState {
-    if !anchor.warmup_complete {
-        AnchorProbeState::WarmingUp
-    } else if anchor.probe.is_some() {
-        AnchorProbeState::Probing
-    } else if active_threads >= anchor.max_threads {
-        AnchorProbeState::AtMax
-    } else if anchor.cooldown_samples > 0 {
-        AnchorProbeState::BackingOff
-    } else {
-        AnchorProbeState::Eligible
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn update_snapshot<E>(
     snapshot: &Arc<RwLock<PiperSnapshot>>,
     links: &[Link],
-    stages: &[RuntimeStage<E>],
-    active_by_stage: &[Vec<usize>],
+    stages: &[RuntimeNode<E>],
+    active_by_node: &[Vec<usize>],
     parked_threads: usize,
     link_controls: &[LinkControl],
-    controls: &[StageControl],
+    controls: &[NodeControl],
     output_link: usize,
     global_worker_cap: usize,
     shutdown_requested: bool,
@@ -5110,7 +5132,7 @@ fn update_snapshot<E>(
             smoothed_len: control.smoothed_len,
         })
         .collect();
-    snapshot.stages = stages
+    snapshot.nodes = stages
         .iter()
         .enumerate()
         .map(|(index, stage)| {
@@ -5120,11 +5142,11 @@ fn update_snapshot<E>(
                 controls[index].desired_workers
             };
             let active_threads = if controls[index].is_weighted_branch {
-                active_by_stage[index].len().max(1)
+                active_by_node[index].len().max(1)
             } else {
-                active_by_stage[index].len()
+                active_by_node[index].len()
             };
-            StageSnapshot {
+            NodeSnapshot {
                 index,
                 name: stage.name.clone(),
                 input_link: stage.input_link,
@@ -5142,11 +5164,13 @@ fn update_snapshot<E>(
                 per_worker_throughput: controls[index].per_worker_throughput,
                 desired_workers,
                 scaling_state: controls[index].scaling_state,
-                is_anchor: controls[index].anchor.is_some(),
-                is_fixed_anchor: controls[index]
-                    .anchor
-                    .as_ref()
-                    .is_some_and(|anchor| anchor.fixed_threads.is_some()),
+                is_anchor: controls[index].is_anchor,
+                thread_policy_kind: thread_policy_kind(controls[index].thread_policy),
+                fixed_thread_count: fixed_thread_count(controls[index].thread_policy),
+                max_thread_count: max_thread_count(controls[index].thread_policy),
+                target_queue_seconds: target_queue_seconds(controls[index].thread_policy),
+                low_queue_seconds: low_queue_seconds(controls[index].thread_policy),
+                backlog_seconds: controls[index].backlog_seconds,
                 is_external: stage.is_external,
                 external_input_rate: if stage.is_external {
                     link_controls[stage.input_link].drain_rate
@@ -5165,20 +5189,16 @@ fn update_snapshot<E>(
         .iter()
         .enumerate()
         .filter_map(|(index, control)| {
-            control.anchor.as_ref().map(|anchor| AnchorSnapshot {
-                stage_index: index,
-                stage_name: stages[index].name.clone(),
-                active_threads: active_by_stage[index].len(),
-                max_threads: anchor.max_threads,
-                fixed_threads: anchor.fixed_threads,
-                probe_state: anchor_probe_state(anchor, active_by_stage[index].len()),
-                last_probe_outcome: anchor.last_probe_outcome,
-                last_probe_reason: anchor.last_probe_reason,
+            control.is_anchor.then(|| AnchorSnapshot {
+                node_index: index,
+                node_name: stages[index].name.clone(),
+                active_threads: active_by_node[index].len(),
+                last_pressure_reason: control.last_anchor_pressure_reason,
             })
         })
         .collect();
     snapshot.parked_threads = parked_threads;
-    snapshot.total_active_workers = active_worker_count(active_by_stage);
+    snapshot.total_active_workers = active_worker_count(active_by_node);
     snapshot.global_worker_cap = global_worker_cap;
     snapshot.budget_pressure = snapshot.total_active_workers >= global_worker_cap;
     snapshot.output_backpressure = link_controls[output_link].trend.is_growing();
@@ -5207,9 +5227,9 @@ mod tests {
         Boom,
     }
 
-    struct TestStage;
+    struct TestNode;
 
-    impl Stage for TestStage {
+    impl Node for TestNode {
         type Input = u8;
         type Output = u8;
         type Error = TestError;
@@ -5223,7 +5243,7 @@ mod tests {
             &self,
             _state: &mut Self::State,
             input: Self::Input,
-            ctx: &mut StageContext<Self::Output, Self::Error>,
+            ctx: &mut NodeContext<Self::Output, Self::Error>,
         ) -> std::result::Result<(), Self::Error> {
             ctx.emit(input);
             Ok(())
@@ -5239,36 +5259,39 @@ mod tests {
         }
     }
 
-    fn support_control() -> StageControl {
-        StageControl {
+    fn support_control() -> NodeControl {
+        NodeControl {
             is_external: false,
             is_weighted_branch: false,
+            is_anchor: false,
+            thread_policy: ResolvedThreadPolicy::ImplicitSupport,
             processed_count: 0,
             busy_ratio: 0.0,
             service_time_ewma: 1_000_000.0,
             per_worker_throughput: 1_000.0,
             desired_workers: 1,
+            backlog_seconds: 0.0,
             last_sample_processed: 0,
-            scaling_state: StageScalingState::Eligible,
+            scaling_state: NodeScalingState::Eligible,
             settling: false,
             settle_samples: 0,
             settle_observed_work: false,
-            idle_samples: 0,
+            scale_down_eligible_since: None,
+            last_anchor_pressure_reason: None,
             last_operation: None,
-            anchor: None,
         }
     }
 
-    fn anchor_control(max_threads: usize) -> StageControl {
-        StageControl {
-            anchor: Some(AnchorControl {
+    fn scalable_control(max_threads: usize) -> NodeControl {
+        NodeControl {
+            is_anchor: true,
+            thread_policy: ResolvedThreadPolicy::Scalable(ResolvedScalePolicy {
+                initial_threads: 1,
                 max_threads,
-                fixed_threads: None,
-                warmup_complete: true,
-                probe: None,
-                cooldown_samples: 0,
-                last_probe_outcome: AnchorProbeOutcome::None,
-                last_probe_reason: AnchorProbeReason::None,
+                target_queue_seconds: 1.0,
+                low_queue_seconds: 0.25,
+                scale_down_after: Duration::from_millis(500),
+                underutilized_busy_ratio: 0.35,
             }),
             busy_ratio: 0.8,
             desired_workers: max_threads,
@@ -5294,19 +5317,34 @@ mod tests {
         }
     }
 
-    fn linear_runtime_stages(count: usize) -> Vec<RuntimeStage<TestError>> {
+    fn linear_runtime_nodes(count: usize) -> Vec<RuntimeNode<TestError>> {
         (0..count)
-            .map(|index| RuntimeStage {
-                name: format!("stage{index}"),
-                stage: Some(Arc::new(StageAdapter { stage: TestStage })),
+            .map(|index| RuntimeNode {
+                name: format!("node{index}"),
+                stage: Some(Arc::new(NodeAdapter { stage: TestNode })),
                 output_acquire: None,
-                anchor: None,
+                is_anchor: false,
+                thread_policy: ResolvedThreadPolicy::ImplicitSupport,
                 input_link: index,
                 output_links: vec![index + 1],
                 weighted_branch_config: None,
                 is_external: false,
             })
             .collect()
+    }
+
+    fn linear_runtime_nodes_with_anchor(count: usize, anchor_index: usize) -> Vec<RuntimeNode<TestError>> {
+        let mut nodes = linear_runtime_nodes(count);
+        nodes[anchor_index].is_anchor = true;
+        nodes[anchor_index].thread_policy = ResolvedThreadPolicy::Scalable(ResolvedScalePolicy {
+            initial_threads: 1,
+            max_threads: 4,
+            target_queue_seconds: 1.0,
+            low_queue_seconds: 0.25,
+            scale_down_after: Duration::from_millis(500),
+            underutilized_busy_ratio: 0.35,
+        });
+        nodes
     }
 
     #[test]
@@ -5454,14 +5492,14 @@ mod tests {
             link(QueueTrend::Growing),
             link(QueueTrend::Stable),
         ];
-        let mut controls = vec![anchor_control(1), support_control()];
+        let mut controls = vec![scalable_control(1), support_control()];
         controls[1].desired_workers = 2;
-        let stages = linear_runtime_stages(active.len());
+        let nodes = linear_runtime_nodes(active.len());
 
         assert!(matches!(
-            choose_scale_operation(&links, &active, &mut controls, &stages, 2, 4),
+            choose_scale_operation(&links, &active, &mut controls, &nodes, 2, 4),
             Some(ScaleOperation::Add {
-                stage_index: 1,
+                node_index: 1,
                 reason: ScaleReason::Support
             })
         ));
@@ -5476,42 +5514,18 @@ mod tests {
             link(QueueTrend::Draining),
             link(QueueTrend::Stable),
         ];
-        let mut controls = vec![support_control(), support_control(), anchor_control(4)];
+        let mut controls = vec![support_control(), support_control(), scalable_control(4)];
         controls[1].desired_workers = 2;
-        let stages = linear_runtime_stages(active.len());
+        controls[2].busy_ratio = 0.8;
+        let nodes = linear_runtime_nodes_with_anchor(active.len(), 2);
 
         assert!(matches!(
-            choose_scale_operation(&links, &active, &mut controls, &stages, 3, 6),
-            Some(ScaleOperation::Add {
-                stage_index: 1,
-                reason: ScaleReason::Support
-            })
-        ));
-    }
-
-    #[test]
-    fn unsuppliable_anchor_input_reduces_anchor() {
-        let active = vec![vec![0], vec![1], vec![2, 3]];
-        let links = vec![
-            link(QueueTrend::Starved),
-            link(QueueTrend::Starved),
-            link(QueueTrend::Draining),
-            link(QueueTrend::Stable),
-        ];
-        let mut controls = vec![support_control(), support_control(), anchor_control(4)];
-        let stages = linear_runtime_stages(active.len());
-
-        assert!(matches!(
-            choose_scale_operation(&links, &active, &mut controls, &stages, 3, 6),
-            Some(ScaleOperation::Remove {
-                stage_index: 2,
-                reason: ScaleReason::AnchorRevert,
-                ..
-            })
+            choose_scale_operation(&links, &active, &mut controls, &nodes, 3, 6),
+            Some(ScaleOperation::Add { node_index: 1, .. })
         ));
         assert_eq!(
-            controls[2].anchor.as_ref().unwrap().last_probe_reason,
-            AnchorProbeReason::InputUnderfed
+            controls[2].last_anchor_pressure_reason,
+            Some(AnchorPressureReason::InputUnderfed)
         );
     }
 
@@ -5523,14 +5537,14 @@ mod tests {
             link(QueueTrend::Growing),
             link(QueueTrend::Stable),
         ];
-        let mut controls = vec![anchor_control(4), support_control()];
+        let mut controls = vec![scalable_control(4), support_control()];
         controls[1].desired_workers = 2;
-        let stages = linear_runtime_stages(active.len());
+        let nodes = linear_runtime_nodes(active.len());
 
         assert!(matches!(
-            choose_scale_operation(&links, &active, &mut controls, &stages, 2, 3),
+            choose_scale_operation(&links, &active, &mut controls, &nodes, 2, 3),
             Some(ScaleOperation::Remove {
-                stage_index: 0,
+                node_index: 0,
                 reason: ScaleReason::BudgetPressure,
                 ..
             })
@@ -5538,115 +5552,19 @@ mod tests {
     }
 
     #[test]
-    fn output_growth_sets_backpressure_and_blocks_anchor_scaling() {
-        let active = vec![vec![0, 1], vec![2]];
+    fn output_growth_blocks_scale_up() {
+        let active = vec![vec![0], vec![1]];
         let links = vec![
             link(QueueTrend::Stable),
             link(QueueTrend::Stable),
             link(QueueTrend::Growing),
         ];
-        let mut controls = vec![anchor_control(4), support_control()];
-        let stages = linear_runtime_stages(active.len());
+        let mut controls = vec![scalable_control(4)];
+        controls[0].backlog_seconds = 2.0;
+        controls[0].desired_workers = 3;
+        let nodes = linear_runtime_nodes(active.len());
 
-        assert!(matches!(
-            choose_scale_operation(&links, &active, &mut controls, &stages, 2, 4),
-            Some(ScaleOperation::Remove {
-                stage_index: 0,
-                reason: ScaleReason::AnchorRevert,
-                ..
-            })
-        ));
-        assert_eq!(
-            controls[0].anchor.as_ref().unwrap().last_probe_reason,
-            AnchorProbeReason::OutputBackpressure
-        );
-    }
-
-    #[test]
-    fn support_shrink_settling_does_not_block_anchor_probe_decision() {
-        let active = vec![vec![0], vec![1, 2, 3]];
-        let links = vec![
-            link(QueueTrend::Stable),
-            link(QueueTrend::Stable),
-            link(QueueTrend::Stable),
-        ];
-        let mut controls = vec![support_control(), anchor_control(4)];
-        controls[0].settling = true;
-        controls[0].last_operation = Some((ScaleDirection::Remove, Instant::now()));
-        controls[1].scaling_state = StageScalingState::Probing;
-        controls[1].anchor.as_mut().unwrap().probe = Some(AnchorProbe {
-            worker_id: 3,
-            samples: PROBE_SETTLE_SAMPLES,
-            observed_work: true,
-        });
-        let stages = linear_runtime_stages(active.len());
-
-        assert!(
-            choose_anchor_probe_operation(&links, &active, &mut controls, &stages, 1, 2, 8)
-                .is_none()
-        );
-        let anchor = controls[1].anchor.as_ref().unwrap();
-        assert!(anchor.probe.is_none());
-        assert_eq!(anchor.last_probe_outcome, AnchorProbeOutcome::Kept);
-        assert_eq!(anchor.last_probe_reason, AnchorProbeReason::None);
-        assert_eq!(anchor.cooldown_samples, 2);
-        assert_eq!(controls[1].scaling_state, StageScalingState::Eligible);
-    }
-
-    #[test]
-    fn support_growth_settling_still_blocks_anchor_probe_decision() {
-        let active = vec![vec![0], vec![1, 2, 3]];
-        let links = vec![
-            link(QueueTrend::Stable),
-            link(QueueTrend::Stable),
-            link(QueueTrend::Stable),
-        ];
-        let mut controls = vec![support_control(), anchor_control(4)];
-        controls[0].settling = true;
-        controls[0].last_operation = Some((ScaleDirection::Add, Instant::now()));
-        controls[1].scaling_state = StageScalingState::Probing;
-        controls[1].anchor.as_mut().unwrap().probe = Some(AnchorProbe {
-            worker_id: 3,
-            samples: PROBE_SETTLE_SAMPLES,
-            observed_work: true,
-        });
-        let stages = linear_runtime_stages(active.len());
-
-        assert!(
-            choose_anchor_probe_operation(&links, &active, &mut controls, &stages, 1, 2, 8)
-                .is_none()
-        );
-        let anchor = controls[1].anchor.as_ref().unwrap();
-        assert!(anchor.probe.is_some());
-        assert_eq!(anchor.last_probe_outcome, AnchorProbeOutcome::None);
-        assert_eq!(anchor.cooldown_samples, 0);
-        assert_eq!(controls[1].scaling_state, StageScalingState::Probing);
-    }
-
-    #[test]
-    fn delayed_idle_shrink_preserves_short_gaps_then_removes_one() {
-        let active = vec![vec![0], vec![1, 2]];
-        let links = vec![
-            link(QueueTrend::Stable),
-            link(QueueTrend::Starved),
-            link(QueueTrend::Stable),
-        ];
-        let mut controls = vec![anchor_control(1), support_control()];
-        controls[1].desired_workers = 2;
-        controls[1].idle_samples = IDLE_SHRINK_SAMPLES - 1;
-        let stages = linear_runtime_stages(active.len());
-
-        assert!(choose_idle_operation(&links, &active, &mut controls, &stages).is_none());
-
-        controls[1].idle_samples = IDLE_SHRINK_SAMPLES;
-        assert!(matches!(
-            choose_idle_operation(&links, &active, &mut controls, &stages),
-            Some(ScaleOperation::Remove {
-                stage_index: 1,
-                reason: ScaleReason::Idle,
-                ..
-            })
-        ));
+        assert!(choose_scale_operation(&links, &active, &mut controls, &nodes, 2, 8).is_none());
     }
 
     #[test]
@@ -5695,13 +5613,13 @@ mod tests {
         let config = test_config();
         let mut builder = PipelineGraphBuilder::<u8, TestError>::new();
         let input = builder.input();
-        let output = builder.add_stage(
+        let output = builder.add_node(
             input,
             anchor(
-                inline_stage(
+                inline_node(
                     "cleanup",
                     || -> std::result::Result<(), TestError> { Ok(()) },
-                    |_state: &mut (), input: u8, ctx: &mut StageContext<u8, TestError>| {
+                    |_state: &mut (), input: u8, ctx: &mut NodeContext<u8, TestError>| {
                         ctx.emit(input);
                         Ok(())
                     },

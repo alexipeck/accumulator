@@ -1,5 +1,5 @@
 use piper::{
-    BufferLease, PiperConfig, Stage, StageContext, StageExt, TelemetryLogConfig, anchor, pipeline,
+    BufferLease, Node, NodeContext, NodeExt, PiperConfig, TelemetryLogConfig, anchor, pipeline,
 };
 use std::io::{self, Write};
 use std::sync::{
@@ -26,7 +26,7 @@ enum ExampleError {}
 
 struct Prepare;
 
-impl Stage for Prepare {
+impl Node for Prepare {
     type Input = Batch;
     type Output = BatchLease;
     type Error = ExampleError;
@@ -40,7 +40,7 @@ impl Stage for Prepare {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         let mut output = ctx.acquire_output();
         output.extend(
@@ -55,7 +55,7 @@ impl Stage for Prepare {
 
 struct Normalize;
 
-impl Stage for Normalize {
+impl Node for Normalize {
     type Input = BatchLease;
     type Output = BatchLease;
     type Error = ExampleError;
@@ -69,7 +69,7 @@ impl Stage for Normalize {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         let mut output = ctx.acquire_output();
         output.extend(input.iter().map(|value| {
@@ -84,7 +84,7 @@ impl Stage for Normalize {
 
 struct Compute;
 
-impl Stage for Compute {
+impl Node for Compute {
     type Input = BatchLease;
     type Output = BatchLease;
     type Error = ExampleError;
@@ -98,7 +98,7 @@ impl Stage for Compute {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         let mut output = ctx.acquire_output();
         for &value in input.iter() {
@@ -118,7 +118,7 @@ impl Stage for Compute {
 
 struct Emit;
 
-impl Stage for Emit {
+impl Node for Emit {
     type Input = BatchLease;
     type Output = BatchLease;
     type Error = ExampleError;
@@ -132,7 +132,7 @@ impl Stage for Emit {
         &self,
         _state: &mut Self::State,
         input: Self::Input,
-        ctx: &mut StageContext<Self::Output, Self::Error>,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         ctx.emit(input);
         Ok(())
@@ -147,7 +147,7 @@ pipeline! {
 
         config = config();
 
-        stages = [
+        nodes = [
             Prepare.with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
             Normalize.with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
             anchor(Compute)
