@@ -1,6 +1,6 @@
 use piper::{
-    Node, NodeContext, PiperConfig, RecvOutputError, SendInputError, TelemetryLogConfig, anchor,
-    node, pipeline,
+    BufferLease, Node, NodeContext, PiperConfig, RecvOutputError, SendInputError,
+    TelemetryLogConfig, anchor, node, pipeline,
 };
 use std::sync::{
     Arc,
@@ -21,6 +21,7 @@ static MANAGED_BATCHES: AtomicUsize = AtomicUsize::new(0);
 static EXTERNAL_BATCHES: AtomicUsize = AtomicUsize::new(0);
 
 type Batch = Vec<u64>;
+type BatchLease = BufferLease<Batch>;
 
 #[derive(Debug, Error)]
 enum ExampleError {
@@ -60,7 +61,7 @@ struct ManagedHash;
 
 impl Node for ManagedHash {
     type Input = Batch;
-    type Output = Batch;
+    type Output = BatchLease;
     type Error = ExampleError;
     type State = ();
 
@@ -75,7 +76,9 @@ impl Node for ManagedHash {
         ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         MANAGED_BATCHES.fetch_add(1, Ordering::Relaxed);
-        ctx.emit(hash_batch(&input, MANAGED_ROUNDS));
+        let mut output = ctx.acquire_output();
+        output.extend(hash_batch(&input, MANAGED_ROUNDS));
+        ctx.emit(output);
         Ok(())
     }
 }
@@ -83,7 +86,7 @@ impl Node for ManagedHash {
 struct Normalize;
 
 impl Node for Normalize {
-    type Input = Batch;
+    type Input = BatchLease;
     type Output = Batch;
     type Error = ExampleError;
     type State = ();
@@ -98,7 +101,7 @@ impl Node for Normalize {
         input: Self::Input,
         ctx: &mut NodeContext<Self::Output, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
-        ctx.emit(input);
+        ctx.emit(input.into_inner());
         Ok(())
     }
 }
@@ -112,8 +115,11 @@ pipeline! {
         config = config();
         nodes = {
             prepare = node("prepare", Prepare),
-            managed_hash = anchor(ManagedHash).max_threads(max_parallelism()),
-            external_hash = external_node(Batch, Batch),
+            managed_hash = anchor(ManagedHash)
+                .max_threads(max_parallelism())
+                .with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
+            external_hash = external_node(Batch, BatchLease)
+                .with_reusable_output(|| Vec::<u64>::with_capacity(BATCH_SIZE)),
             normalize = node("normalize", Normalize),
         };
         graph = {
@@ -151,7 +157,7 @@ fn max_parallelism() -> usize {
 }
 
 fn spawn_external_hash_workers(
-    external_hash: piper::ExternalNode<Batch, Batch, ExampleError>,
+    external_hash: piper::ExternalNode<Batch, BatchLease, ExampleError>,
 ) -> Vec<thread::JoinHandle<()>> {
     (0..EXTERNAL_WORKERS)
         .map(|_| {
@@ -161,9 +167,9 @@ fn spawn_external_hash_workers(
                     match external_hash.recv_timeout(Duration::from_millis(5)) {
                         Ok(batch) => {
                             EXTERNAL_BATCHES.fetch_add(1, Ordering::Relaxed);
-                            if let Err(SendInputError) =
-                                external_hash.send(hash_batch(&batch, EXTERNAL_ROUNDS))
-                            {
+                            let mut output = external_hash.acquire_output();
+                            output.extend(hash_batch(&batch, EXTERNAL_ROUNDS));
+                            if let Err(SendInputError) = external_hash.send(output) {
                                 break;
                             }
                         }

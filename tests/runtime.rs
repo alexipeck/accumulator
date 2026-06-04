@@ -1,8 +1,9 @@
 use piper::{
-    IntoNodeSpec, NodeThreadPolicyKind, PipelineGraph, PipelineGraphBuilder, Piper, PiperConfig,
-    NodeScalePolicy, PiperError, SingleThreadWeightedBranchConfig, Node, NodeContext,
-    TelemetryLogConfig, anchor, inline_node, node, pipeline,
+    BufferLease, IntoNodeSpec, NodeThreadPolicyKind, PipelineGraph, PipelineGraphBuilder, Piper,
+    PiperConfig, NodeScalePolicy, PiperError, SingleThreadWeightedBranchConfig, Node, NodeContext,
+    TelemetryLogConfig, anchor, inline_node, node, panic_payload_to_string, pipeline,
 };
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -358,6 +359,90 @@ fn external_node_bridges_user_loop_into_managed_node() {
         42
     );
     worker.join().unwrap();
+    piper.join().unwrap();
+}
+
+#[test]
+fn external_node_acquires_reusable_output_buffer() {
+    let factory_count = Arc::new(AtomicUsize::new(0));
+    let factory_count_for_builder = Arc::clone(&factory_count);
+
+    let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+    let input = builder.input();
+    let external_output = builder.link::<BufferLease<Vec<u32>>>();
+    let external_token = builder.add_external_node_to_with_reusable_output(
+        input,
+        "external",
+        external_output,
+        move || {
+            factory_count_for_builder.fetch_add(1, Ordering::Relaxed);
+            Vec::<u32>::new()
+        },
+    );
+    let mut piper = Piper::<u32, BufferLease<Vec<u32>>, TestError>::start(
+        config(),
+        builder.finish(external_output),
+    )
+    .unwrap();
+    let external = piper.take_external_node(external_token);
+
+    let worker = std::thread::spawn(move || {
+        loop {
+            match external.recv_timeout(Duration::from_millis(5)) {
+                Ok(value) => {
+                    let mut lease = external.acquire_output();
+                    lease.push(value);
+                    external.send(lease).unwrap();
+                }
+                Err(piper::RecvOutputError::Timeout) if external.is_shutting_down() => break,
+                Err(piper::RecvOutputError::Timeout) => continue,
+                Err(piper::RecvOutputError::Closed) => break,
+                Err(error) => panic!("external recv failed: {error}"),
+            }
+        }
+    });
+
+    piper.sender().send(1).unwrap();
+    let first = piper
+        .receiver()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(&*first, &[1]);
+    drop(first);
+
+    piper.sender().send(2).unwrap();
+    let second = piper
+        .receiver()
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(&*second, &[2]);
+    drop(second);
+
+    assert_eq!(factory_count.load(Ordering::Relaxed), 1);
+
+    piper.shutdown();
+    worker.join().unwrap();
+    piper.join().unwrap();
+}
+
+#[test]
+fn external_node_acquire_output_panics_without_factory() {
+    let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+    let input = builder.input();
+    let output = builder.link::<u32>();
+    let external_token = builder.add_external_node_to::<u32, u32>(input, "external", output);
+    let mut piper = Piper::<u32, u32, TestError>::start(config(), builder.finish(output)).unwrap();
+    let external = piper.take_external_node(external_token);
+
+    let panic_payload = catch_unwind(AssertUnwindSafe(|| {
+        let _ = external.acquire_output();
+    }))
+    .expect_err("acquire_output should panic without factory");
+    let message = panic_payload_to_string(panic_payload);
+    assert!(message.contains("external_node.acquire_output()"));
+
+    piper.shutdown();
+    drop(external);
     piper.join().unwrap();
 }
 

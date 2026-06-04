@@ -459,6 +459,7 @@ where
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
     internal_failure: channel::Sender<InternalFailure>,
+    output_acquire: Option<Arc<AcquireFn<Out>>>,
     _marker: PhantomData<fn(In, Out, E)>,
 }
 
@@ -478,6 +479,7 @@ where
             shutdown: Arc::clone(&self.shutdown),
             abort: Arc::clone(&self.abort),
             internal_failure: self.internal_failure.clone(),
+            output_acquire: self.output_acquire.clone(),
             _marker: PhantomData,
         }
     }
@@ -489,6 +491,15 @@ where
     Out: Send + 'static,
     E: Debug + Display + Send + 'static,
 {
+    pub fn acquire_output(&self) -> Out {
+        let acquire = self.output_acquire.as_ref().unwrap_or_else(|| {
+            panic!(
+                "external_node.acquire_output() was called for an external node without a reusable output factory"
+            )
+        });
+        acquire()
+    }
+
     pub fn recv(&self) -> std::result::Result<In, RecvOutputError> {
         let input = self.input.recv().map_err(|_| RecvOutputError::Closed)?;
         self.input_stats.drains.fetch_add(1, Ordering::Relaxed);
@@ -1019,10 +1030,7 @@ where
         T: Recycle + Send + 'static,
         Factory: Fn() -> T + Send + Sync + 'static,
     {
-        self.output_acquire_builder = Some(Arc::new(RecycleAcquireBuilder {
-            factory: Arc::new(factory),
-            _marker: PhantomData::<fn() -> T>,
-        }));
+        self.output_acquire_builder = Some(reusable_output_acquire_builder(factory));
         self
     }
 
@@ -1264,6 +1272,19 @@ trait OutputAcquireBuilder {
     fn build(&self, runtime: LeaseRuntime) -> DynAcquire;
 }
 
+fn reusable_output_acquire_builder<T, Factory>(
+    factory: Factory,
+) -> Arc<dyn OutputAcquireBuilder + Send + Sync>
+where
+    T: Recycle + Send + 'static,
+    Factory: Fn() -> T + Send + Sync + 'static,
+{
+    Arc::new(RecycleAcquireBuilder {
+        factory: Arc::new(factory),
+        _marker: PhantomData::<fn() -> T>,
+    })
+}
+
 struct RecycleAcquireBuilder<T>
 where
     T: Recycle + Send + 'static,
@@ -1337,6 +1358,7 @@ struct UntypedExternalNode {
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
     internal_failure: channel::Sender<InternalFailure>,
+    output_acquire: Option<DynAcquire>,
 }
 
 impl UntypedExternalNode {
@@ -1346,6 +1368,15 @@ impl UntypedExternalNode {
         Out: Send + 'static,
         E: Debug + Display + Send + 'static,
     {
+        let output_acquire = match self.output_acquire {
+            Some(acquire) => Some(
+                Arc::downcast::<Arc<AcquireFn<Out>>>(acquire)
+                    .unwrap_or_else(|_| panic!("external node output factory type mismatch"))
+                    .as_ref()
+                    .clone(),
+            ),
+            None => None,
+        };
         ExternalNode {
             name: self.name,
             input: self.input,
@@ -1355,6 +1386,7 @@ impl UntypedExternalNode {
             shutdown: self.shutdown,
             abort: self.abort,
             internal_failure: self.internal_failure,
+            output_acquire,
             _marker: PhantomData,
         }
     }
@@ -1972,6 +2004,56 @@ where
         token
     }
 
+    pub fn add_external_node_with_reusable_output<ExtIn, ExtOut, T, Factory>(
+        &mut self,
+        input: GraphLink<ExtIn>,
+        name: impl Into<String>,
+        factory: Factory,
+    ) -> (GraphLink<ExtOut>, ExternalNodeToken<ExtIn, ExtOut>)
+    where
+        ExtIn: Send + 'static,
+        ExtOut: Send + BufferLeaseOutput<T> + 'static,
+        T: Recycle + Send + 'static,
+        Factory: Fn() -> T + Send + Sync + 'static,
+    {
+        let output = self.link();
+        let token =
+            self.add_external_node_to_with_reusable_output(input, name, output, factory);
+        (output, token)
+    }
+
+    pub fn add_external_node_to_with_reusable_output<ExtIn, ExtOut, T, Factory>(
+        &mut self,
+        input: GraphLink<ExtIn>,
+        name: impl Into<String>,
+        output: GraphLink<ExtOut>,
+        factory: Factory,
+    ) -> ExternalNodeToken<ExtIn, ExtOut>
+    where
+        ExtIn: Send + 'static,
+        ExtOut: Send + BufferLeaseOutput<T> + 'static,
+        T: Recycle + Send + 'static,
+        Factory: Fn() -> T + Send + Sync + 'static,
+    {
+        let token = ExternalNodeToken {
+            index: self.external_count,
+            _marker: PhantomData,
+        };
+        self.external_count += 1;
+        self.nodes.push(GraphNodeSpec {
+            name: name.into(),
+            stage: None,
+            output_acquire_builder: Some(reusable_output_acquire_builder(factory)),
+            is_anchor: false,
+            thread_hints: ThreadPolicyHints::default(),
+            input_link: input.index,
+            output_links: vec![output.index],
+            weighted_branch_config: None,
+            external_index: Some(token.index),
+        });
+        token
+    }
+
     #[cfg(feature = "feeder")]
     pub fn feeder_link<T>(&mut self, link: GraphLink<T>, config: FeederLinkConfig)
     where
@@ -2089,6 +2171,7 @@ where
     output_links: Vec<usize>,
     weighted_branch_config: Option<SingleThreadWeightedBranchConfig>,
     is_external: bool,
+    external_index: Option<usize>,
 }
 
 enum WorkerCommand<E>
@@ -2768,23 +2851,6 @@ where
         let input_stats = Arc::clone(&links[input_link].stats);
         let output_stats = Arc::clone(&links[output_link].stats);
 
-        let mut external_nodes: Vec<Option<UntypedExternalNode>> =
-            (0..external_count).map(|_| None).collect();
-        for stage in &stages {
-            if let Some(external_index) = stage.external_index {
-                external_nodes[external_index] = Some(UntypedExternalNode {
-                    name: stage.name.clone(),
-                    input: links[stage.input_link].make_input(),
-                    input_stats: Arc::clone(&links[stage.input_link].stats),
-                    output: links[stage.output_links[0]].make_output(),
-                    output_stats: Arc::clone(&links[stage.output_links[0]].stats),
-                    shutdown: Arc::clone(&shutdown),
-                    abort: Arc::clone(&abort),
-                    internal_failure: internal_failure_sender.clone(),
-                });
-            }
-        }
-
         let runtime_stages: Vec<_> = stages
             .into_iter()
             .map(|stage| {
@@ -2803,9 +2869,28 @@ where
                     output_links: stage.output_links,
                     weighted_branch_config: stage.weighted_branch_config,
                     is_external,
+                    external_index: stage.external_index,
                 })
             })
             .collect::<Result<Vec<_>, E>>()?;
+
+        let mut external_nodes: Vec<Option<UntypedExternalNode>> =
+            (0..external_count).map(|_| None).collect();
+        for stage in &runtime_stages {
+            if let Some(external_index) = stage.external_index {
+                external_nodes[external_index] = Some(UntypedExternalNode {
+                    name: stage.name.clone(),
+                    input: links[stage.input_link].make_input(),
+                    input_stats: Arc::clone(&links[stage.input_link].stats),
+                    output: links[stage.output_links[0]].make_output(),
+                    output_stats: Arc::clone(&links[stage.output_links[0]].stats),
+                    shutdown: Arc::clone(&shutdown),
+                    abort: Arc::clone(&abort),
+                    internal_failure: internal_failure_sender.clone(),
+                    output_acquire: stage.output_acquire.clone(),
+                });
+            }
+        }
 
         let required_base = required_base_workers(&runtime_stages);
         let global_worker_cap = resolve_global_worker_cap(
@@ -5329,6 +5414,7 @@ mod tests {
                 output_links: vec![index + 1],
                 weighted_branch_config: None,
                 is_external: false,
+                external_index: None,
             })
             .collect()
     }

@@ -83,7 +83,19 @@ With the `feeder` feature enabled, `PipelineGraphBuilder::feeder_link(...)` can 
 
 ## External node pipeline
 
-Use `external_node(Input, Output)` when Piper should own the graph, channels, telemetry, cancellation, and shutdown while user code owns the worker loop. The runnable example in [examples/external_node_pipeline.rs](examples/external_node_pipeline.rs) forks prepared batches to one managed hash branch and one external hash branch, then joins both branches back into a managed normalize node.
+Use `external_node(Input, Output)` when Piper should own the graph, channels, telemetry, cancellation, and shutdown while user code owns the worker loop. For reusable leased outputs, chain `.with_reusable_output(factory)` on the macro declaration or call `PipelineGraphBuilder::add_external_node_with_reusable_output` / `add_external_node_to_with_reusable_output` when building the graph manually. External workers acquire buffers with `external.acquire_output()` the same way managed nodes use `ctx.acquire_output()`.
+
+```rust
+external_hash = external_node(Batch, BufferLease<Vec<u64>>)
+    .with_reusable_output(|| Vec::with_capacity(BATCH_SIZE)),
+
+// worker loop
+let mut output = external.acquire_output();
+output.extend(hash_batch(&batch, ROUNDS));
+external.send(output)?;
+```
+
+The runnable example in [examples/external_node_pipeline.rs](examples/external_node_pipeline.rs) forks prepared batches to one managed hash branch and one external hash branch, then joins both branches back into a managed normalize node.
 
 ```bash
 cargo run --release --example external_node_pipeline

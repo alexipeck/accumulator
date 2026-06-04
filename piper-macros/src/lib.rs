@@ -31,7 +31,11 @@ struct NamedNode {
 
 enum NamedNodeKind {
     Managed(Expr),
-    External { input: Type, output: Type },
+    External {
+        input: Type,
+        output: Type,
+        reusable_factory: Option<Expr>,
+    },
 }
 
 struct GraphExpansion {
@@ -116,11 +120,40 @@ impl Parse for NamedNode {
                 if !content.is_empty() {
                     return Err(content.error("expected exactly two external node types"));
                 }
+                let reusable_factory = if input.peek(Token![.]) {
+                    input.parse::<Token![.]>()?;
+                    let method: Ident = input.parse()?;
+                    if method != "with_reusable_output" {
+                        return Err(syn::Error::new(
+                            method.span(),
+                            "external nodes only support `.with_reusable_output(factory)`",
+                        ));
+                    }
+                    let factory_content;
+                    parenthesized!(factory_content in input);
+                    let factory = factory_content.parse::<Expr>()?;
+                    if factory_content.peek(Token![,]) {
+                        factory_content.parse::<Token![,]>()?;
+                    }
+                    if !factory_content.is_empty() {
+                        return Err(factory_content.error("unexpected tokens in with_reusable_output"));
+                    }
+                    if input.peek(Token![.]) {
+                        return Err(syn::Error::new(
+                            input.span(),
+                            "external nodes support at most one `.with_reusable_output(...)` chain",
+                        ));
+                    }
+                    Some(factory)
+                } else {
+                    None
+                };
                 return Ok(NamedNode {
                     name,
                     kind: NamedNodeKind::External {
                         input: input_type,
                         output: output_type,
+                        reusable_factory,
                     },
                 });
             }
@@ -508,12 +541,35 @@ fn expand_named_graph(
                     __piper_builder.add_node_to(#in_link, #name, #out_link);
                 });
             }
-            NamedNodeKind::External { input, output } => {
+            NamedNodeKind::External {
+                input,
+                output,
+                reusable_factory,
+            } => {
                 let token_ident = format_ident!("__piper_external_{name}");
-                node_decls.extend(quote! {
-                    let #token_ident = __piper_builder
-                        .add_external_node_to::<#input, #output>(#in_link, stringify!(#name), #out_link);
-                });
+                match reusable_factory {
+                    Some(factory) => {
+                        node_decls.extend(quote! {
+                            let #token_ident = __piper_builder
+                                .add_external_node_to_with_reusable_output::<#input, #output, _, _>(
+                                    #in_link,
+                                    stringify!(#name),
+                                    #out_link,
+                                    #factory,
+                                );
+                        });
+                    }
+                    None => {
+                        node_decls.extend(quote! {
+                            let #token_ident = __piper_builder
+                                .add_external_node_to::<#input, #output>(
+                                    #in_link,
+                                    stringify!(#name),
+                                    #out_link,
+                                );
+                        });
+                    }
+                }
                 external_nodes.push(ExternalNodeDecl {
                     name,
                     input,

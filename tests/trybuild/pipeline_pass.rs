@@ -1,4 +1,4 @@
-use piper::{PiperConfig, Node, NodeContext, anchor, inline_node, node, pipeline};
+use piper::{BufferLease, PiperConfig, Node, NodeContext, anchor, inline_node, node, pipeline};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -127,12 +127,13 @@ pipeline! {
 pipeline! {
     pub struct ExternalPipeline {
         type Input = u8;
-        type Output = u16;
+        type Output = BufferLease<Vec<u16>>;
         type Error = MacroError;
 
         config = config();
         nodes = {
-            external = external_node(u8, u16),
+            external = external_node(u8, BufferLease<Vec<u16>>)
+                .with_reusable_output(|| Vec::<u16>::new()),
         };
         graph = {
             input -> external;
@@ -145,6 +146,7 @@ fn external_run_shape(run: ExternalPipelineRun) {
     let _sender = run.sender();
     let _receiver = run.receiver();
     let _external = run.external.clone();
+    let _lease = run.external.acquire_output();
     run.shutdown();
     run.abort();
     let _telemetry = run.get_telemetry();
