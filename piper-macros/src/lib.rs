@@ -17,6 +17,7 @@ struct PipelineInput {
     config: Expr,
     nodes: NodeDecls,
     graph: Option<Vec<Edge>>,
+    return_state: Option<Type>,
 }
 
 enum NodeDecls {
@@ -41,6 +42,12 @@ enum NamedNodeKind {
 struct GraphExpansion {
     build_graph: proc_macro2::TokenStream,
     external_nodes: Vec<ExternalNodeDecl>,
+    return_state: Option<ReturnStateDecl>,
+}
+
+struct ReturnStateDecl {
+    state: Type,
+    mergeable: bool,
 }
 
 struct ExternalNodeDecl {
@@ -181,6 +188,7 @@ impl Parse for PipelineInput {
         let mut config = None;
         let mut nodes = None;
         let mut graph = None;
+        let mut return_state = None;
 
         while !content.is_empty() {
             if content.peek(Token![type]) {
@@ -242,10 +250,14 @@ impl Parse for PipelineInput {
                     graph = Some(edges);
                     content.parse::<Token![;]>()?;
                 }
+                "return_state" => {
+                    return_state = Some(content.parse()?);
+                    content.parse::<Token![;]>()?;
+                }
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
-                        "expected config, nodes, or graph assignment",
+                        "expected config, nodes, graph, or return_state assignment",
                     ));
                 }
             }
@@ -265,6 +277,7 @@ impl Parse for PipelineInput {
             nodes: nodes
                 .ok_or_else(|| syn::Error::new(content.span(), "missing `nodes = ...;`"))?,
             graph,
+            return_state,
         })
     }
 }
@@ -280,12 +293,15 @@ pub fn pipeline(input: TokenStream) -> TokenStream {
         config,
         nodes,
         graph,
+        return_state,
     } = parse_macro_input!(input as PipelineInput);
 
     let expansion = match (nodes, graph) {
-        (NodeDecls::Linear(nodes), None) => expand_linear_graph(&input, &output, &error, nodes),
+        (NodeDecls::Linear(nodes), None) => {
+            expand_linear_graph(&input, &output, &error, nodes, return_state)
+        }
         (NodeDecls::Named(nodes), Some(edges)) => {
-            match expand_named_graph(&input, &output, &error, nodes, edges) {
+            match expand_named_graph(&input, &output, &error, nodes, edges, return_state) {
                 Ok(tokens) => tokens,
                 Err(error) => return error.to_compile_error().into(),
             }
@@ -306,8 +322,121 @@ pub fn pipeline(input: TokenStream) -> TokenStream {
     };
 
     let build_graph = expansion.build_graph;
+    let return_state = expansion.return_state;
 
-    if expansion.external_nodes.is_empty() {
+    if let Some(return_state) = return_state {
+        let state = return_state.state;
+        let mergeable = return_state.mergeable;
+        let merge_const = if mergeable {
+            quote!(true)
+        } else {
+            quote!(false)
+        };
+        if expansion.external_nodes.is_empty() {
+            quote! {
+                #vis struct #name;
+
+                impl #name {
+                    pub fn start() -> ::piper::Result<::piper::PiperWithState<#input, #output, #state, #error, #merge_const>, #error> {
+                        #build_graph
+                        ::piper::PiperWithState::start(#config, __piper_graph)
+                    }
+                }
+            }
+            .into()
+        } else {
+            let run_name = format_ident!("{name}Run");
+            let external_fields = expansion.external_nodes.iter().map(|external| {
+                let field = &external.name;
+                let input = &external.input;
+                let output = &external.output;
+                quote! {
+                    pub #field: ::piper::ExternalNode<#input, #output, #error>
+                }
+            });
+            let external_takes = expansion.external_nodes.iter().map(|external| {
+                let field = &external.name;
+                let token = &external.token_ident;
+                quote! {
+                    let #field = __piper.take_external_node(#token);
+                }
+            });
+            let external_names: Vec<_> = expansion
+                .external_nodes
+                .iter()
+                .map(|external| &external.name)
+                .collect();
+            let join_merged_method = if mergeable {
+                quote! {
+                    pub fn join_merged(self) -> ::piper::Result<#state, #error> {
+                        let #run_name {
+                            piper,
+                            #(#external_names,)*
+                        } = self;
+                        drop((#(#external_names,)*));
+                        piper.join_merged()
+                    }
+                }
+            } else {
+                quote! {}
+            };
+
+            quote! {
+                #vis struct #name;
+
+                #vis struct #run_name {
+                    pub piper: ::piper::PiperWithState<#input, #output, #state, #error, #merge_const>,
+                    #(#external_fields,)*
+                }
+
+                impl #name {
+                    pub fn start() -> ::piper::Result<#run_name, #error> {
+                        #build_graph
+                        let mut __piper = ::piper::PiperWithState::start(#config, __piper_graph)?;
+                        #(#external_takes)*
+                        Ok(#run_name {
+                            piper: __piper,
+                            #(#external_names,)*
+                        })
+                    }
+                }
+
+                impl #run_name {
+                    pub fn sender(&self) -> ::piper::PiperSender<#input> {
+                        self.piper.sender()
+                    }
+
+                    pub fn receiver(&self) -> ::piper::PiperReceiver<#output> {
+                        self.piper.receiver()
+                    }
+
+                    pub fn shutdown(&self) {
+                        self.piper.shutdown();
+                    }
+
+                    pub fn abort(&self) {
+                        self.piper.abort();
+                    }
+
+                    pub fn get_telemetry(&self) -> ::piper::PiperSnapshot {
+                        self.piper.get_telemetry()
+                    }
+
+                    pub fn join(self) -> ::piper::Result<::std::vec::Vec<#state>, #error> {
+                        let #run_name {
+                            piper,
+                            #(#external_names,)*
+                        } = self;
+                        drop((#(#external_names,)*));
+                        piper.join()
+                    }
+
+                    #join_merged_method
+                }
+            }
+            .into()
+        }
+    } else if expansion.external_nodes.is_empty() {
         quote! {
             #vis struct #name;
 
@@ -402,7 +531,14 @@ fn expand_linear_graph(
     output: &Type,
     error: &Type,
     nodes: Vec<Expr>,
+    return_state: Option<Type>,
 ) -> GraphExpansion {
+    let return_state_decl = return_state.map(|state| ReturnStateDecl {
+        mergeable: nodes
+            .last()
+            .is_some_and(expr_declares_state_merge),
+        state,
+    });
     let mut tokens = quote! {
         let mut __piper_builder = ::piper::PipelineGraphBuilder::<#input, #error>::new();
         let __piper_link_0 = __piper_builder.input();
@@ -415,12 +551,26 @@ fn expand_linear_graph(
         });
         previous = next;
     }
-    tokens.extend(quote! {
-        let __piper_graph = __piper_builder.finish::<#output>(#previous);
-    });
+    if let Some(return_state) = &return_state_decl {
+        let state = &return_state.state;
+        if return_state.mergeable {
+            tokens.extend(quote! {
+                let __piper_graph = __piper_builder.finish_with_merged_state::<#output, #state>(#previous);
+            });
+        } else {
+            tokens.extend(quote! {
+                let __piper_graph = __piper_builder.finish_with_state::<#output, #state>(#previous);
+            });
+        }
+    } else {
+        tokens.extend(quote! {
+            let __piper_graph = __piper_builder.finish::<#output>(#previous);
+        });
+    }
     GraphExpansion {
         build_graph: tokens,
         external_nodes: Vec::new(),
+        return_state: return_state_decl,
     }
 }
 
@@ -430,7 +580,15 @@ fn expand_named_graph(
     error: &Type,
     nodes: Vec<NamedNode>,
     edges: Vec<Edge>,
+    return_state: Option<Type>,
 ) -> Result<GraphExpansion> {
+    let return_state_decl = match return_state {
+        Some(state) => Some(ReturnStateDecl {
+            mergeable: named_return_state_mergeable(&nodes, &edges)?,
+            state,
+        }),
+        None => None,
+    };
     let declared: HashSet<String> = nodes.iter().map(|node| node.name.to_string()).collect();
     let mut parent = HashMap::<String, String>::new();
     let mut used_inputs = HashSet::<String>::new();
@@ -581,14 +739,33 @@ fn expand_named_graph(
     }
 
     Ok(GraphExpansion {
-        build_graph: quote! {
-            let mut __piper_builder = ::piper::PipelineGraphBuilder::<#input, #error>::new();
-            #link_decls
-            #node_decls
-            let __piper_graph = __piper_builder.finish::<#output>(#output_link);
-            let _ = #input_link;
+        build_graph: {
+            let finish = if let Some(return_state) = &return_state_decl {
+                let state = &return_state.state;
+                if return_state.mergeable {
+                    quote! {
+                        let __piper_graph = __piper_builder.finish_with_merged_state::<#output, #state>(#output_link);
+                    }
+                } else {
+                    quote! {
+                        let __piper_graph = __piper_builder.finish_with_state::<#output, #state>(#output_link);
+                    }
+                }
+            } else {
+                quote! {
+                    let __piper_graph = __piper_builder.finish::<#output>(#output_link);
+                }
+            };
+            quote! {
+                let mut __piper_builder = ::piper::PipelineGraphBuilder::<#input, #error>::new();
+                #link_decls
+                #node_decls
+                #finish
+                let _ = #input_link;
+            }
         },
         external_nodes,
+        return_state: return_state_decl,
     })
 }
 
@@ -687,4 +864,76 @@ fn detect_cycles(nodes: &[NamedNode], adjacency: &HashMap<String, Vec<String>>) 
         }
     }
     Ok(())
+}
+
+fn named_return_state_mergeable(nodes: &[NamedNode], edges: &[Edge]) -> Result<bool> {
+    let mut producers = Vec::new();
+    for edge in edges {
+        if edge
+            .to
+            .endpoints
+            .iter()
+            .any(|endpoint| matches!(endpoint, Endpoint::Output))
+        {
+            producers.extend(edge.from.endpoints.iter());
+        }
+    }
+
+    if producers.len() != 1 {
+        let span = nodes
+            .first()
+            .map(|node| node.name.span())
+            .unwrap_or(proc_macro2::Span::call_site());
+        return Err(syn::Error::new(
+            span,
+            "return_state requires exactly one managed node to feed `output`",
+        ));
+    }
+
+    let Endpoint::Node(final_node) = producers[0] else {
+        return Err(syn::Error::new_spanned(
+            quote!(return_state),
+            "return_state requires the final output producer to be a managed node",
+        ));
+    };
+    let Some(node) = nodes
+        .iter()
+        .find(|node| node.name == *final_node)
+    else {
+        return Err(syn::Error::new_spanned(final_node, "unknown graph node"));
+    };
+    match &node.kind {
+        NamedNodeKind::Managed(expr) => Ok(expr_declares_state_merge(expr)),
+        NamedNodeKind::External { .. } => Err(syn::Error::new_spanned(
+            final_node,
+            "return_state requires the final output producer to be a managed node",
+        )),
+    }
+}
+
+fn expr_declares_state_merge(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(call) => {
+            expr_path_last_ident(&call.func)
+                .is_some_and(|ident| ident == "node_with_state_merge")
+                || expr_declares_state_merge(&call.func)
+                || call.args.iter().any(expr_declares_state_merge)
+        }
+        Expr::MethodCall(method) => expr_declares_state_merge(&method.receiver),
+        Expr::Paren(paren) => expr_declares_state_merge(&paren.expr),
+        Expr::Group(group) => expr_declares_state_merge(&group.expr),
+        Expr::Reference(reference) => expr_declares_state_merge(&reference.expr),
+        Expr::Try(expr_try) => expr_declares_state_merge(&expr_try.expr),
+        _ => false,
+    }
+}
+
+fn expr_path_last_ident(expr: &Expr) -> Option<String> {
+    let Expr::Path(path) = expr else {
+        return None;
+    };
+    path.path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
 }

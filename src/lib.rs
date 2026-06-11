@@ -1,7 +1,7 @@
 #[cfg(not(any(feature = "channel-kanal", feature = "channel-crossbeam")))]
 compile_error!("enable `channel-kanal` or `channel-crossbeam`");
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::any::Any;
 #[cfg(feature = "feeder")]
@@ -69,8 +69,14 @@ pub enum PiperError<E: Debug + Display = String> {
     #[error("cleanup closure failed in worker `{worker}`: {error}")]
     UserCleanup { worker: String, error: E },
 
+    #[error("merge closure failed in worker `{worker}`: {error}")]
+    UserMerge { worker: String, error: E },
+
     #[error("finalize closure failed in worker `{worker}`: {error}")]
     UserFinalize { worker: String, error: E },
+
+    #[error("node `{node}` does not provide a state merge function")]
+    MissingStateMerge { node: String },
 
     #[error("external node `{node}` failed: {error}")]
     ExternalNode { node: String, error: E },
@@ -351,6 +357,7 @@ pub struct NodeSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeScalingState {
     Eligible,
+    Merging,
     Settling,
     BackingOff,
 }
@@ -571,10 +578,10 @@ where
     }
 
     pub fn fail(&self, error: E) {
-        self.abort.store(true, Ordering::Release);
         let _ = self
             .internal_failure
             .send(InternalFailure::external(self.name.clone(), error));
+        self.abort.store(true, Ordering::Release);
     }
 }
 
@@ -861,6 +868,20 @@ where
     ) -> std::result::Result<(), NodeFailure<E>>;
 
     fn cleanup_box(&self, state: Box<dyn Any + Send>) -> std::result::Result<(), NodeFailure<E>>;
+
+    fn merge_box(
+        &self,
+        _target: &mut dyn Any,
+        _source: Box<dyn Any + Send>,
+    ) -> std::result::Result<(), NodeFailure<E>> {
+        Err(NodeFailure::Internal(
+            "node does not provide a state merge function".to_string(),
+        ))
+    }
+
+    fn can_merge_state(&self) -> bool {
+        false
+    }
 }
 
 struct RuntimeNodeContext {
@@ -937,6 +958,102 @@ where
             .map(|state| *state)
             .map_err(|_| NodeFailure::Internal("node cleanup state type mismatch".to_string()))?;
         self.stage.cleanup(state).map_err(NodeFailure::Cleanup)
+    }
+}
+
+struct MergeNodeAdapter<S, Merge>
+where
+    S: Node,
+    Merge: Fn(&mut S::State, S::State) -> std::result::Result<(), S::Error>
+        + Send
+        + Sync
+        + 'static,
+{
+    stage: S,
+    merge: Merge,
+}
+
+impl<S, Merge> DynNode<S::Error> for MergeNodeAdapter<S, Merge>
+where
+    S: Node,
+    Merge: Fn(&mut S::State, S::State) -> std::result::Result<(), S::Error>
+        + Send
+        + Sync
+        + 'static,
+{
+    fn init_box(&self) -> std::result::Result<Box<dyn Any + Send>, NodeFailure<S::Error>> {
+        self.stage
+            .init()
+            .map(|state| Box::new(state) as Box<dyn Any + Send>)
+            .map_err(NodeFailure::Init)
+    }
+
+    fn process_box(
+        &self,
+        state: &mut dyn Any,
+        input: Message,
+        ctx: RuntimeNodeContext,
+    ) -> std::result::Result<(), NodeFailure<S::Error>> {
+        let state = state
+            .downcast_mut::<S::State>()
+            .ok_or_else(|| NodeFailure::Internal("node state type mismatch".to_string()))?;
+        let input = input
+            .downcast::<S::Input>()
+            .map(|input| *input)
+            .map_err(|_| NodeFailure::Internal("node input type mismatch".to_string()))?;
+        let output_acquire = match ctx.output_acquire {
+            Some(acquire) => Some(
+                Arc::downcast::<Arc<AcquireFn<S::Output>>>(acquire)
+                    .map_err(|_| {
+                        NodeFailure::Internal("node output factory type mismatch".to_string())
+                    })?
+                    .as_ref()
+                    .clone(),
+            ),
+            None => None,
+        };
+        let mut ctx = NodeContext {
+            output: ctx.output,
+            output_stats: ctx.output_stats,
+            output_acquire,
+            shutdown: ctx.shutdown,
+            abort: ctx.abort,
+            internal_failure: ctx.internal_failure,
+            _marker: PhantomData,
+        };
+        self.stage
+            .process(state, input, &mut ctx)
+            .map_err(NodeFailure::Process)
+    }
+
+    fn cleanup_box(
+        &self,
+        state: Box<dyn Any + Send>,
+    ) -> std::result::Result<(), NodeFailure<S::Error>> {
+        let state = state
+            .downcast::<S::State>()
+            .map(|state| *state)
+            .map_err(|_| NodeFailure::Internal("node cleanup state type mismatch".to_string()))?;
+        self.stage.cleanup(state).map_err(NodeFailure::Cleanup)
+    }
+
+    fn merge_box(
+        &self,
+        target: &mut dyn Any,
+        source: Box<dyn Any + Send>,
+    ) -> std::result::Result<(), NodeFailure<S::Error>> {
+        let target = target
+            .downcast_mut::<S::State>()
+            .ok_or_else(|| NodeFailure::Internal("node merge target state type mismatch".to_string()))?;
+        let source = source
+            .downcast::<S::State>()
+            .map(|source| *source)
+            .map_err(|_| NodeFailure::Internal("node merge source state type mismatch".to_string()))?;
+        (self.merge)(target, source).map_err(NodeFailure::Merge)
+    }
+
+    fn can_merge_state(&self) -> bool {
+        true
     }
 }
 
@@ -1131,6 +1248,31 @@ where
     }
 }
 
+pub fn node_with_state_merge<S, Merge>(
+    name: impl Into<String>,
+    stage_impl: S,
+    merge: Merge,
+) -> NodeSpec<S::Input, S::Output, S::Error>
+where
+    S: Node,
+    Merge: Fn(&mut S::State, S::State) -> std::result::Result<(), S::Error>
+        + Send
+        + Sync
+        + 'static,
+{
+    NodeSpec {
+        name: name.into(),
+        stage: Arc::new(MergeNodeAdapter {
+            stage: stage_impl,
+            merge,
+        }),
+        output_acquire_builder: None,
+        is_anchor: false,
+        thread_hints: ThreadPolicyHints::default(),
+        _marker: PhantomData,
+    }
+}
+
 pub fn anchor<S, E>(node_like: S) -> NodeSpec<S::Input, S::Output, E>
 where
     S: IntoNodeSpec<E>,
@@ -1316,6 +1458,7 @@ enum NodeFailure<E> {
     Init(E),
     Process(E),
     Cleanup(E),
+    Merge(E),
     Internal(String),
 }
 
@@ -1664,19 +1807,19 @@ impl LinkReceiver {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        match &self.inner {
-            LinkReceiverInner::Standard(receiver) => receiver.is_empty(),
-            #[cfg(feature = "feeder")]
-            LinkReceiverInner::Feeder(_) => false,
-        }
-    }
-
     fn is_terminated(&self) -> bool {
         match &self.inner {
             LinkReceiverInner::Standard(receiver) => receiver.is_terminated(),
             #[cfg(feature = "feeder")]
             LinkReceiverInner::Feeder(input) => input.is_closed(),
+        }
+    }
+
+    fn should_stop_on_shutdown_timeout(&self, is_input_stage: bool) -> bool {
+        match &self.inner {
+            LinkReceiverInner::Standard(receiver) => is_input_stage && receiver.is_empty(),
+            #[cfg(feature = "feeder")]
+            LinkReceiverInner::Feeder(_) => true,
         }
     }
 }
@@ -1835,9 +1978,26 @@ where
     link_count: usize,
     nodes: Vec<GraphNodeSpec<E>>,
     external_count: usize,
+    state_return: Option<StateReturnConfig>,
     #[cfg(feature = "feeder")]
     feeder_links: HashMap<usize, FeederLinkConfig>,
     _marker: PhantomData<fn(In) -> Out>,
+}
+
+pub struct PipelineGraphWithState<In, Out, State, E = String, const MERGE: bool = false>
+where
+    In: Send + 'static,
+    Out: Send + 'static,
+    State: Send + 'static,
+    E: Debug + Display + Send + 'static,
+{
+    graph: PipelineGraph<In, Out, E>,
+    _marker: PhantomData<fn() -> State>,
+}
+
+#[derive(Clone, Copy)]
+struct StateReturnConfig {
+    require_merge: bool,
 }
 
 pub struct PipelineGraphBuilder<In, E = String>
@@ -2072,8 +2232,45 @@ where
             link_count: self.link_count.max(output.index + 1),
             nodes: self.nodes,
             external_count: self.external_count,
+            state_return: None,
             #[cfg(feature = "feeder")]
             feeder_links: self.feeder_links,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn finish_with_state<Out, State>(
+        self,
+        output: GraphLink<Out>,
+    ) -> PipelineGraphWithState<In, Out, State, E, false>
+    where
+        Out: Send + 'static,
+        State: Send + 'static,
+    {
+        let mut graph = self.finish(output);
+        graph.state_return = Some(StateReturnConfig {
+            require_merge: false,
+        });
+        PipelineGraphWithState {
+            graph,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn finish_with_merged_state<Out, State>(
+        self,
+        output: GraphLink<Out>,
+    ) -> PipelineGraphWithState<In, Out, State, E, true>
+    where
+        Out: Send + 'static,
+        State: Send + 'static,
+    {
+        let mut graph = self.finish(output);
+        graph.state_return = Some(StateReturnConfig {
+            require_merge: true,
+        });
+        PipelineGraphWithState {
+            graph,
             _marker: PhantomData,
         }
     }
@@ -2172,6 +2369,7 @@ where
     weighted_branch_config: Option<SingleThreadWeightedBranchConfig>,
     is_external: bool,
     external_index: Option<usize>,
+    return_state_on_exit: bool,
 }
 
 enum WorkerCommand<E>
@@ -2189,18 +2387,27 @@ where
 {
     node_index: usize,
     stage: Arc<dyn DynNode<E>>,
+    initial_state: Option<Message>,
     input: LinkReceiver,
     input_stats: Arc<LinkStats>,
     output: LinkSender,
     output_stats: Arc<LinkStats>,
     output_acquire: Option<DynAcquire>,
     is_input_stage: bool,
-    retire: Arc<AtomicBool>,
+    retire: Arc<RetireControl>,
+    merge_pending: Arc<AtomicBool>,
+    merge_requests: channel::Receiver<MergeRequest>,
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
     poll_interval: Duration,
     internal_failure: channel::Sender<InternalFailure>,
     stats: Arc<WorkerStats>,
+    return_state_on_exit: bool,
+}
+
+struct MergeRequest {
+    source_worker_id: usize,
+    state_receiver: channel::Receiver<Message>,
 }
 
 struct WeightedBranchAssignment {
@@ -2216,7 +2423,7 @@ struct WeightedBranchAssignment {
     controller: WeightedBranchController,
     sample_interval: Duration,
     is_input_stage: bool,
-    retire: Arc<AtomicBool>,
+    retire: Arc<RetireControl>,
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
     poll_interval: Duration,
@@ -2418,6 +2625,12 @@ where
     Parked {
         worker_id: usize,
         node_index: usize,
+        returned_state: Option<Message>,
+    },
+    MergeCompleted {
+        worker_id: usize,
+        node_index: usize,
+        source_worker_id: usize,
     },
     Failed {
         worker_id: usize,
@@ -2436,8 +2649,50 @@ where
     command: channel::Sender<WorkerCommand<E>>,
     handle: Option<JoinHandle<()>>,
     active_node: Option<usize>,
-    retire: Option<Arc<AtomicBool>>,
+    retire: Option<Arc<RetireControl>>,
+    merge_pending: Option<Arc<AtomicBool>>,
+    merge_sender: Option<channel::Sender<MergeRequest>>,
     stats: Arc<WorkerStats>,
+}
+
+struct RetireControl {
+    requested: AtomicBool,
+    transfer_sender: Mutex<Option<channel::Sender<Message>>>,
+}
+
+enum RetireAction {
+    Cleanup,
+    Transfer(channel::Sender<Message>),
+}
+
+impl RetireControl {
+    fn new() -> Self {
+        Self {
+            requested: AtomicBool::new(false),
+            transfer_sender: Mutex::new(None),
+        }
+    }
+
+    fn request_cleanup(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    fn request_transfer(&self, sender: channel::Sender<Message>) {
+        *self.transfer_sender.lock() = Some(sender);
+        self.requested.store(true, Ordering::Release);
+    }
+
+    fn take_request(&self) -> Option<RetireAction> {
+        if !self.requested.load(Ordering::Acquire) {
+            return None;
+        }
+        let transfer = self.transfer_sender.lock().take();
+        self.requested.store(false, Ordering::Release);
+        Some(match transfer {
+            Some(sender) => RetireAction::Transfer(sender),
+            None => RetireAction::Cleanup,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -2459,22 +2714,25 @@ impl WorkerStats {
 enum ScaleDirection {
     Add,
     Remove,
+    Merge,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ScaleReason {
-    Support,
-    Scalable,
-    AnchorPressure,
-    BudgetPressure,
-    Idle,
-}
-
-struct PendingScale {
-    worker_id: usize,
-    node_index: usize,
-    direction: ScaleDirection,
-    reason: ScaleReason,
+enum PendingScale {
+    Add {
+        worker_id: usize,
+        node_index: usize,
+    },
+    Remove {
+        worker_id: usize,
+        node_index: usize,
+    },
+    MergeDown {
+        source_worker_id: usize,
+        target_worker_id: usize,
+        node_index: usize,
+        state_receiver: Option<channel::Receiver<Message>>,
+        waiting_for_target: bool,
+    },
 }
 
 struct NodeControl {
@@ -2724,8 +2982,9 @@ where
     shutdown: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
     snapshot: Arc<RwLock<PiperSnapshot>>,
-    supervisor: Option<JoinHandle<Result<(), E>>>,
+    supervisor: Option<JoinHandle<Result<SupervisorResult, E>>>,
     external_nodes: Vec<Option<UntypedExternalNode>>,
+    state_return_stage: Option<Arc<dyn DynNode<E>>>,
 }
 
 impl<In, Out, E> Piper<In, Out, E>
@@ -2745,6 +3004,7 @@ where
             link_count,
             nodes: stages,
             external_count,
+            state_return,
             #[cfg(feature = "feeder")]
             feeder_links,
             ..
@@ -2795,6 +3055,50 @@ where
             }
         }
         validate_graph_is_acyclic(&stages)?;
+
+        let return_state_node_index = if let Some(config) = state_return {
+            let producers: Vec<_> = stages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, stage)| {
+                    stage
+                        .output_links
+                        .iter()
+                        .any(|&link| link == output_link)
+                        .then_some(index)
+                })
+                .collect();
+            if producers.len() != 1 {
+                return Err(PiperError::InvalidGraph {
+                    message:
+                        "return_state requires exactly one managed node to feed `output`"
+                            .to_string(),
+                });
+            }
+            let node_index = producers[0];
+            let stage = &stages[node_index];
+            if stage.external_index.is_some()
+                || stage.weighted_branch_config.is_some()
+                || stage.stage.is_none()
+            {
+                return Err(PiperError::InvalidGraph {
+                    message:
+                        "return_state requires the final output producer to be a managed node"
+                            .to_string(),
+                });
+            }
+            let stage_impl = stage.stage.as_ref().expect("managed state exists");
+            if config.require_merge && !stage_impl.can_merge_state() {
+                return Err(PiperError::MissingStateMerge {
+                    node: stage.name.clone(),
+                });
+            }
+            Some(node_index)
+        } else {
+            None
+        };
+        let state_return_stage = return_state_node_index
+            .and_then(|index| stages[index].stage.as_ref().cloned());
 
         let anchor_count = stages.iter().filter(|stage| stage.is_anchor).count();
         if anchor_count == 0 && config.global_worker_cap == Some(0) {
@@ -2853,7 +3157,8 @@ where
 
         let runtime_stages: Vec<_> = stages
             .into_iter()
-            .map(|stage| {
+            .enumerate()
+            .map(|(index, stage)| {
                 let thread_policy =
                     resolve_thread_policy(stage.is_anchor, stage.thread_hints)?;
                 let is_external = stage.external_index.is_some();
@@ -2870,6 +3175,7 @@ where
                     weighted_branch_config: stage.weighted_branch_config,
                     is_external,
                     external_index: stage.external_index,
+                    return_state_on_exit: return_state_node_index == Some(index),
                 })
             })
             .collect::<Result<Vec<_>, E>>()?;
@@ -3023,6 +3329,7 @@ where
             snapshot,
             supervisor: Some(supervisor),
             external_nodes,
+            state_return_stage,
         })
     }
 
@@ -3061,7 +3368,7 @@ where
             .into_typed()
     }
 
-    pub fn join(mut self) -> Result<(), E> {
+    fn join_supervisor(mut self) -> Result<SupervisorResult, E> {
         self.shutdown();
         self.external_nodes.clear();
         if let Some(supervisor) = self.supervisor.take() {
@@ -3072,8 +3379,175 @@ where
                     message: panic_payload_to_string(payload),
                 })?
         } else {
-            Ok(())
+            Ok(SupervisorResult {
+                returned_states: Vec::new(),
+            })
         }
+    }
+
+    pub fn join(self) -> Result<(), E> {
+        self.join_supervisor().map(|_| ())
+    }
+
+    fn join_returned_states<State>(self) -> Result<Vec<State>, E>
+    where
+        State: Send + 'static,
+    {
+        let result = self.join_supervisor()?;
+        result
+            .returned_states
+            .into_iter()
+            .map(|state| {
+                state
+                    .downcast::<State>()
+                    .map(|state| *state)
+                    .map_err(|_| PiperError::Internal {
+                        worker: "piper-supervisor".to_string(),
+                        message: "returned node state type mismatch".to_string(),
+                    })
+            })
+            .collect()
+    }
+
+    fn join_merged_state<State>(self) -> Result<State, E>
+    where
+        State: Send + 'static,
+    {
+        let stage = self
+            .state_return_stage
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| PiperError::Internal {
+                worker: "piper-supervisor".to_string(),
+                message: "pipeline does not have a returned state node".to_string(),
+            })?;
+        if !stage.can_merge_state() {
+            return Err(PiperError::MissingStateMerge {
+                node: "returned-state node".to_string(),
+            });
+        }
+
+        let mut states = self.join_supervisor()?.returned_states.into_iter();
+        let mut merged = states.next().ok_or_else(|| PiperError::Internal {
+            worker: "piper-supervisor".to_string(),
+            message: "no returned node state was collected".to_string(),
+        })?;
+        for state in states {
+            stage
+                .merge_box(merged.as_mut(), state)
+                .map_err(|failure| node_failure_to_piper_error("piper-supervisor", failure))?;
+        }
+        merged
+            .downcast::<State>()
+            .map(|state| *state)
+            .map_err(|_| PiperError::Internal {
+                worker: "piper-supervisor".to_string(),
+                message: "returned node state type mismatch".to_string(),
+            })
+    }
+}
+
+pub struct PiperWithState<In, Out, State, E = String, const MERGE: bool = false>
+where
+    In: Send + 'static,
+    Out: Send + 'static,
+    State: Send + 'static,
+    E: Debug + Display + Send + 'static,
+{
+    inner: Piper<In, Out, E>,
+    _marker: PhantomData<fn() -> State>,
+}
+
+impl<In, Out, State, E, const MERGE: bool> PiperWithState<In, Out, State, E, MERGE>
+where
+    In: Send + 'static,
+    Out: Send + 'static,
+    State: Send + 'static,
+    E: Debug + Display + Send + 'static,
+{
+    pub fn start(
+        config: PiperConfig,
+        graph: PipelineGraphWithState<In, Out, State, E, MERGE>,
+    ) -> Result<Self, E> {
+        Piper::start(config, graph.graph).map(|inner| Self {
+            inner,
+            _marker: PhantomData,
+        })
+    }
+
+    pub fn sender(&self) -> PiperSender<In> {
+        self.inner.sender()
+    }
+
+    pub fn receiver(&self) -> PiperReceiver<Out> {
+        self.inner.receiver()
+    }
+
+    pub fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+
+    pub fn abort(&self) {
+        self.inner.abort();
+    }
+
+    pub fn get_telemetry(&self) -> PiperSnapshot {
+        self.inner.get_telemetry()
+    }
+
+    pub fn take_external_node<ExtIn, ExtOut>(
+        &mut self,
+        token: ExternalNodeToken<ExtIn, ExtOut>,
+    ) -> ExternalNode<ExtIn, ExtOut, E>
+    where
+        ExtIn: Send + 'static,
+        ExtOut: Send + 'static,
+    {
+        self.inner.take_external_node(token)
+    }
+
+    pub fn join(self) -> Result<Vec<State>, E> {
+        self.inner.join_returned_states()
+    }
+}
+
+impl<In, Out, State, E> PiperWithState<In, Out, State, E, true>
+where
+    In: Send + 'static,
+    Out: Send + 'static,
+    State: Send + 'static,
+    E: Debug + Display + Send + 'static,
+{
+    pub fn join_merged(self) -> Result<State, E> {
+        self.inner.join_merged_state()
+    }
+}
+
+fn node_failure_to_piper_error<E>(worker: &str, failure: NodeFailure<E>) -> PiperError<E>
+where
+    E: Debug + Display + Send + 'static,
+{
+    match failure {
+        NodeFailure::Init(error) => PiperError::UserInit {
+            worker: worker.to_string(),
+            error,
+        },
+        NodeFailure::Process(error) => PiperError::UserProcess {
+            worker: worker.to_string(),
+            error,
+        },
+        NodeFailure::Cleanup(error) => PiperError::UserCleanup {
+            worker: worker.to_string(),
+            error,
+        },
+        NodeFailure::Merge(error) => PiperError::UserMerge {
+            worker: worker.to_string(),
+            error,
+        },
+        NodeFailure::Internal(message) => PiperError::Internal {
+            worker: worker.to_string(),
+            message,
+        },
     }
 }
 
@@ -3777,7 +4251,7 @@ fn run_supervisor<E>(
     internal_failure_receiver: channel::Receiver<InternalFailure>,
     mut csv_recorder: Option<TelemetryLogRecorder>,
     startup_ready_tx: channel::Sender<()>,
-) -> Result<(), E>
+) -> Result<SupervisorResult, E>
 where
     E: Debug + Display + Send + 'static,
 {
@@ -3791,10 +4265,11 @@ where
         .collect();
     let mut controls = build_node_controls(&stages);
     let required_base = required_base_workers(&stages);
-    let mut global_worker_cap =
+    let global_worker_cap =
         resolve_global_worker_cap(config.global_worker_cap, stages.len(), required_base);
     let mut pending_scale = None;
     let mut stored_failure = None;
+    let mut returned_states = Vec::new();
     let mut supervisor_holds_links = true;
     let mut last_sample_at = Instant::now();
 
@@ -3887,28 +4362,10 @@ where
             &mut pending_scale,
             &abort,
             &mut stored_failure,
+            &mut returned_states,
         );
 
-        while let Ok(failure) = internal_failure_receiver.try_recv() {
-            stored_failure = Some(match failure {
-                InternalFailure::Internal { message } => PiperError::Internal {
-                    worker: "piper-supervisor".to_string(),
-                    message,
-                },
-                InternalFailure::Telemetry { message } => PiperError::Telemetry { message },
-                InternalFailure::External { node, error } => match error.downcast::<E>() {
-                    Ok(error) => PiperError::ExternalNode {
-                        node,
-                        error: *error,
-                    },
-                    Err(_) => PiperError::Internal {
-                        worker: "piper-supervisor".to_string(),
-                        message: format!("external node `{node}` reported an invalid error type"),
-                    },
-                },
-            });
-            abort.store(true, Ordering::Release);
-        }
+        drain_internal_failures(&internal_failure_receiver, &abort, &mut stored_failure);
 
         if shutdown.load(Ordering::Acquire)
             || abort.load(Ordering::Acquire)
@@ -3960,10 +4417,7 @@ where
                 global_worker_cap,
             ) {
                 match operation {
-                    ScaleOperation::Add {
-                        node_index,
-                        reason,
-                    } => {
+                    ScaleOperation::Add { node_index } => {
                         let worker_id = match parked.pop() {
                             Some(worker_id) => worker_id,
                             None => {
@@ -3985,11 +4439,9 @@ where
                             &mut workers,
                             &mut active_by_node,
                         )?;
-                        pending_scale = Some(PendingScale {
+                        pending_scale = Some(PendingScale::Add {
                             worker_id,
                             node_index,
-                            direction: ScaleDirection::Add,
-                            reason,
                         });
 
                         while parked.len() < parked_target {
@@ -4002,18 +4454,38 @@ where
                     ScaleOperation::Remove {
                         node_index,
                         worker_id,
-                        reason,
                     } => {
                         if let Some(worker_id) =
                             worker_id.or_else(|| active_by_node[node_index].first().copied())
                         {
-                            if let Some(retire) = workers[worker_id].retire.as_ref() {
-                                retire.store(true, Ordering::Release);
-                                pending_scale = Some(PendingScale {
+                            if node_has_merge_state(&stages[node_index])
+                                && active_by_node[node_index].len() > 1
+                            {
+                                if let Some(target_worker_id) = active_by_node[node_index]
+                                    .iter()
+                                    .copied()
+                                    .find(|candidate| *candidate != worker_id)
+                                {
+                                    if let Some(retire) = workers[worker_id].retire.as_ref() {
+                                        let (state_sender, state_receiver) =
+                                            channel::unbounded::<Message>();
+                                        retire.request_transfer(state_sender);
+                                        pending_scale = Some(PendingScale::MergeDown {
+                                            source_worker_id: worker_id,
+                                            target_worker_id,
+                                            node_index,
+                                            state_receiver: Some(state_receiver),
+                                            waiting_for_target: false,
+                                        });
+                                        controls[node_index].scaling_state =
+                                            NodeScalingState::Merging;
+                                    }
+                                }
+                            } else if let Some(retire) = workers[worker_id].retire.as_ref() {
+                                retire.request_cleanup();
+                                pending_scale = Some(PendingScale::Remove {
                                     worker_id,
                                     node_index,
-                                    direction: ScaleDirection::Remove,
-                                    reason,
                                 });
                             }
                         }
@@ -4043,6 +4515,7 @@ where
             || stored_failure.is_some())
             && active_count == 0
         {
+            drain_internal_failures(&internal_failure_receiver, &abort, &mut stored_failure);
             break;
         }
 
@@ -4086,8 +4559,41 @@ where
     if let Some(failure) = stored_failure {
         Err(failure)
     } else {
-        Ok(())
+        Ok(SupervisorResult { returned_states })
     }
+}
+
+fn drain_internal_failures<E>(
+    receiver: &channel::Receiver<InternalFailure>,
+    abort: &Arc<AtomicBool>,
+    stored_failure: &mut Option<PiperError<E>>,
+) where
+    E: Debug + Display + Send + 'static,
+{
+    while let Ok(failure) = receiver.try_recv() {
+        *stored_failure = Some(match failure {
+            InternalFailure::Internal { message } => PiperError::Internal {
+                worker: "piper-supervisor".to_string(),
+                message,
+            },
+            InternalFailure::Telemetry { message } => PiperError::Telemetry { message },
+            InternalFailure::External { node, error } => match error.downcast::<E>() {
+                Ok(error) => PiperError::ExternalNode {
+                    node,
+                    error: *error,
+                },
+                Err(_) => PiperError::Internal {
+                    worker: "piper-supervisor".to_string(),
+                    message: format!("external node `{node}` reported an invalid error type"),
+                },
+            },
+        });
+        abort.store(true, Ordering::Release);
+    }
+}
+
+struct SupervisorResult {
+    returned_states: Vec<Message>,
 }
 
 fn spawn_worker<E>(
@@ -4122,6 +4628,8 @@ where
         handle: Some(handle),
         active_node: None,
         retire: None,
+        merge_pending: None,
+        merge_sender: None,
         stats: Arc::new(WorkerStats::default()),
     });
     Ok(worker_id)
@@ -4159,7 +4667,7 @@ fn assign_worker<E>(
 where
     E: Debug + Display + Send + 'static,
 {
-    let retire = Arc::new(AtomicBool::new(false));
+    let retire = Arc::new(RetireControl::new());
     workers[worker_id].stats.reset();
     let stage = &stages[node_index];
     if let Some(branch_config) = stage.weighted_branch_config {
@@ -4187,6 +4695,8 @@ where
         };
         workers[worker_id].active_node = Some(node_index);
         workers[worker_id].retire = Some(retire);
+        workers[worker_id].merge_pending = None;
+        workers[worker_id].merge_sender = None;
         active_by_node[node_index].push(worker_id);
         return workers[worker_id]
             .command
@@ -4203,9 +4713,12 @@ where
     })?;
     let output_link = stage.output_links[0];
     let output = links[output_link].make_output();
+    let (merge_sender, merge_receiver) = channel::unbounded::<MergeRequest>();
+    let merge_pending = Arc::new(AtomicBool::new(false));
     let assignment = WorkerAssignment {
         node_index,
         stage: Arc::clone(stage_impl),
+        initial_state: None,
         input: links[stage.input_link].make_input(),
         input_stats: Arc::clone(&links[stage.input_link].stats),
         output,
@@ -4213,14 +4726,19 @@ where
         output_acquire: stage.output_acquire.clone(),
         is_input_stage: stage.input_link == input_link,
         retire: Arc::clone(&retire),
+        merge_pending: Arc::clone(&merge_pending),
+        merge_requests: merge_receiver,
         shutdown: Arc::clone(shutdown),
         abort: Arc::clone(abort),
         poll_interval: config.poll_interval,
         internal_failure: internal_failure.clone(),
         stats: Arc::clone(&workers[worker_id].stats),
+        return_state_on_exit: stage.return_state_on_exit,
     };
     workers[worker_id].active_node = Some(node_index);
     workers[worker_id].retire = Some(retire);
+    workers[worker_id].merge_pending = Some(merge_pending);
+    workers[worker_id].merge_sender = Some(merge_sender);
     active_by_node[node_index].push(worker_id);
     workers[worker_id]
         .command
@@ -4262,9 +4780,41 @@ fn run_assignment<E>(
     E: Debug + Display + Send + 'static,
 {
     let node_index = assignment.node_index;
-    let mut state = match assignment.stage.init_box() {
-        Ok(state) => state,
-        Err(failure) => {
+    let mut state = match assignment.initial_state {
+        Some(state) => state,
+        None => match assignment.stage.init_box() {
+            Ok(state) => state,
+            Err(failure) => {
+                let _ = event_sender.send(WorkerEvent::Failed {
+                    worker_id,
+                    node_index,
+                    worker: worker_name.to_string(),
+                    failure,
+                });
+                return;
+            }
+        },
+    };
+
+    let _ = event_sender.send(WorkerEvent::Started { worker_id });
+
+    let mut exit = WorkerExit::Graceful;
+
+    loop {
+        if assignment.abort.load(Ordering::Acquire) {
+            exit = WorkerExit::Abort;
+            break;
+        }
+
+        if let Err(failure) = drain_merge_requests(
+            worker_id,
+            node_index,
+            assignment.stage.as_ref(),
+            state.as_mut(),
+            &assignment.merge_pending,
+            &assignment.merge_requests,
+            event_sender,
+        ) {
             let _ = event_sender.send(WorkerEvent::Failed {
                 worker_id,
                 node_index,
@@ -4273,27 +4823,11 @@ fn run_assignment<E>(
             });
             return;
         }
-    };
 
-    let _ = event_sender.send(WorkerEvent::Started { worker_id });
-
-    let mut graceful = true;
-
-    loop {
-        if assignment.abort.load(Ordering::Acquire) {
-            graceful = false;
+        if let Some(retire) = assignment.retire.take_request() {
+            exit = WorkerExit::Retire(retire);
             break;
         }
-        if assignment.retire.load(Ordering::Acquire) {
-            break;
-        }
-        if assignment.shutdown.load(Ordering::Acquire)
-            && assignment.is_input_stage
-            && assignment.input.is_empty()
-        {
-            break;
-        }
-
         let wait_started = Instant::now();
         match assignment.input.recv_poll(assignment.poll_interval) {
             RecvPoll::Item(input) => {
@@ -4338,7 +4872,16 @@ fn run_assignment<E>(
                     duration_nanos_u64(wait_started.elapsed()),
                     Ordering::Relaxed,
                 );
-                if assignment.shutdown.load(Ordering::Acquire) || assignment.input.is_terminated() {
+                if assignment.abort.load(Ordering::Acquire) {
+                    exit = WorkerExit::Abort;
+                    break;
+                }
+                if assignment.input.is_terminated()
+                    || (assignment.shutdown.load(Ordering::Acquire)
+                        && assignment
+                            .input
+                            .should_stop_on_shutdown_timeout(assignment.is_input_stage))
+                {
                     break;
                 }
             }
@@ -4347,27 +4890,98 @@ fn run_assignment<E>(
                     duration_nanos_u64(wait_started.elapsed()),
                     Ordering::Relaxed,
                 );
+                if assignment.abort.load(Ordering::Acquire) {
+                    exit = WorkerExit::Abort;
+                }
                 break;
             }
         }
     }
 
-    if graceful {
-        if let Err(failure) = assignment.stage.cleanup_box(state) {
-            let _ = event_sender.send(WorkerEvent::Failed {
+    match exit {
+        WorkerExit::Abort => {}
+        WorkerExit::Graceful if assignment.return_state_on_exit => {
+            let _ = event_sender.send(WorkerEvent::Parked {
                 worker_id,
                 node_index,
-                worker: worker_name.to_string(),
-                failure,
+                returned_state: Some(state),
             });
             return;
+        }
+        WorkerExit::Retire(RetireAction::Transfer(sender)) => {
+            if sender.send(state).is_err() {
+                let _ = event_sender.send(WorkerEvent::Failed {
+                    worker_id,
+                    node_index,
+                    worker: worker_name.to_string(),
+                    failure: NodeFailure::Internal("state transfer receiver closed".to_string()),
+                });
+                return;
+            }
+        }
+        WorkerExit::Graceful | WorkerExit::Retire(RetireAction::Cleanup) => {
+            if let Err(failure) = assignment.stage.cleanup_box(state) {
+                let _ = event_sender.send(WorkerEvent::Failed {
+                    worker_id,
+                    node_index,
+                    worker: worker_name.to_string(),
+                    failure,
+                });
+                return;
+            }
         }
     }
 
     let _ = event_sender.send(WorkerEvent::Parked {
         worker_id,
         node_index,
+        returned_state: None,
     });
+}
+
+enum WorkerExit {
+    Graceful,
+    Abort,
+    Retire(RetireAction),
+}
+
+fn drain_merge_requests<E>(
+    worker_id: usize,
+    node_index: usize,
+    stage: &dyn DynNode<E>,
+    state: &mut dyn Any,
+    merge_pending: &AtomicBool,
+    merge_requests: &channel::Receiver<MergeRequest>,
+    event_sender: &channel::Sender<WorkerEvent<E>>,
+) -> std::result::Result<(), NodeFailure<E>>
+where
+    E: Debug + Display + Send + 'static,
+{
+    if !merge_pending.swap(false, Ordering::AcqRel) {
+        return Ok(());
+    }
+
+    loop {
+        let request = match merge_requests.try_recv() {
+            Ok(request) => request,
+            Err(channel::TryRecvError::Empty) => return Ok(()),
+            Err(channel::TryRecvError::Closed) => {
+                return Err(NodeFailure::Internal(
+                    "worker merge request channel closed".to_string(),
+                ));
+            }
+        };
+        let source_worker_id = request.source_worker_id;
+        let source_state = request.state_receiver.recv().map_err(|_| {
+            NodeFailure::Internal("worker state transfer channel closed".to_string())
+        })?;
+        stage.merge_box(state, source_state)?;
+        let _ = event_sender.send(WorkerEvent::MergeCompleted {
+            worker_id,
+            node_index,
+            source_worker_id,
+        });
+    }
 }
 
 fn run_weighted_branch_assignment<E>(
@@ -4387,16 +5001,9 @@ fn run_weighted_branch_assignment<E>(
         if assignment.abort.load(Ordering::Acquire) {
             break;
         }
-        if assignment.retire.load(Ordering::Acquire) {
+        if assignment.retire.take_request().is_some() {
             break;
         }
-        if assignment.shutdown.load(Ordering::Acquire)
-            && assignment.is_input_stage
-            && assignment.input.is_empty()
-        {
-            break;
-        }
-
         let wait_started = Instant::now();
         match assignment.input.recv_poll(assignment.poll_interval) {
             RecvPoll::Item(message) => {
@@ -4457,7 +5064,12 @@ fn run_weighted_branch_assignment<E>(
                     duration_nanos_u64(wait_started.elapsed()),
                     Ordering::Relaxed,
                 );
-                if assignment.shutdown.load(Ordering::Acquire) || assignment.input.is_terminated() {
+                if assignment.input.is_terminated()
+                    || (assignment.shutdown.load(Ordering::Acquire)
+                        && assignment
+                            .input
+                            .should_stop_on_shutdown_timeout(assignment.is_input_stage))
+                {
                     break;
                 }
             }
@@ -4474,6 +5086,7 @@ fn run_weighted_branch_assignment<E>(
     let _ = event_sender.send(WorkerEvent::Parked {
         worker_id,
         node_index,
+        returned_state: None,
     });
 }
 
@@ -4487,40 +5100,124 @@ fn drain_worker_events<E>(
     pending_scale: &mut Option<PendingScale>,
     abort: &Arc<AtomicBool>,
     stored_failure: &mut Option<PiperError<E>>,
+    returned_states: &mut Vec<Message>,
 ) where
     E: Debug + Display + Send + 'static,
 {
     while let Ok(event) = receiver.try_recv() {
         match event {
             WorkerEvent::Started { worker_id, .. } => {
-                if pending_scale.as_ref().is_some_and(|pending| {
-                    pending.worker_id == worker_id && pending.direction == ScaleDirection::Add
-                }) {
-                    let pending = pending_scale.take().expect("pending scale exists");
-                    record_node_operation(controls, pending.node_index, ScaleDirection::Add);
-                    controls[pending.node_index].settling = true;
-                    controls[pending.node_index].settle_samples = 0;
-                    controls[pending.node_index].settle_observed_work = false;
-                    controls[pending.node_index].scaling_state = NodeScalingState::Settling;
+                if matches!(
+                    pending_scale,
+                    Some(PendingScale::Add {
+                        worker_id: pending_worker,
+                        ..
+                    }) if *pending_worker == worker_id
+                ) {
+                    if let Some(PendingScale::Add { node_index, .. }) = pending_scale.take() {
+                        record_node_operation(controls, node_index, ScaleDirection::Add);
+                        mark_node_settling(controls, node_index);
+                    }
                 }
             }
             WorkerEvent::Parked {
                 worker_id,
                 node_index,
+                returned_state,
             } => {
                 remove_worker_from_node(active_by_node, node_index, worker_id);
                 workers[worker_id].active_node = None;
                 workers[worker_id].retire = None;
+                workers[worker_id].merge_pending = None;
+                workers[worker_id].merge_sender = None;
                 parked.push(worker_id);
-                if pending_scale.as_ref().is_some_and(|pending| {
-                    pending.worker_id == worker_id && pending.direction == ScaleDirection::Remove
-                }) {
-                    let pending = pending_scale.take().expect("pending scale exists");
-                    record_node_operation(controls, pending.node_index, ScaleDirection::Remove);
-                    controls[pending.node_index].settling = true;
-                    controls[pending.node_index].settle_samples = 0;
-                    controls[pending.node_index].settle_observed_work = false;
-                    controls[pending.node_index].scaling_state = NodeScalingState::Settling;
+                if let Some(state) = returned_state {
+                    returned_states.push(state);
+                }
+
+                match pending_scale {
+                    Some(PendingScale::Remove {
+                        worker_id: pending_worker,
+                        ..
+                    }) if *pending_worker == worker_id => {
+                        if let Some(PendingScale::Remove { node_index, .. }) = pending_scale.take()
+                        {
+                            record_node_operation(controls, node_index, ScaleDirection::Remove);
+                            mark_node_settling(controls, node_index);
+                        }
+                    }
+                    Some(PendingScale::MergeDown {
+                        source_worker_id,
+                        target_worker_id,
+                        node_index,
+                        state_receiver,
+                        waiting_for_target,
+                        ..
+                    }) if *source_worker_id == worker_id && !*waiting_for_target => {
+                        let Some(receiver) = state_receiver.take() else {
+                            abort.store(true, Ordering::Release);
+                            *stored_failure = Some(PiperError::Internal {
+                                worker: "piper-supervisor".to_string(),
+                                message: "missing merge state receiver".to_string(),
+                            });
+                            continue;
+                        };
+                        let Some(sender) = workers[*target_worker_id].merge_sender.as_ref() else {
+                            abort.store(true, Ordering::Release);
+                            *stored_failure = Some(PiperError::Internal {
+                                worker: "piper-supervisor".to_string(),
+                                message: "merge target worker is not active".to_string(),
+                            });
+                            continue;
+                        };
+                        if sender
+                            .send(MergeRequest {
+                                source_worker_id: worker_id,
+                                state_receiver: receiver,
+                            })
+                            .is_err()
+                        {
+                            abort.store(true, Ordering::Release);
+                            *stored_failure = Some(PiperError::Internal {
+                                worker: "piper-supervisor".to_string(),
+                                message: "merge target request channel closed".to_string(),
+                            });
+                            continue;
+                        }
+                        if let Some(flag) = workers[*target_worker_id].merge_pending.as_ref() {
+                            flag.store(true, Ordering::Release);
+                            *waiting_for_target = true;
+                            controls[*node_index].scaling_state = NodeScalingState::Merging;
+                        } else {
+                            abort.store(true, Ordering::Release);
+                            *stored_failure = Some(PiperError::Internal {
+                                worker: "piper-supervisor".to_string(),
+                                message: "merge target pending flag is unavailable".to_string(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            WorkerEvent::MergeCompleted {
+                worker_id,
+                node_index,
+                source_worker_id,
+            } => {
+                if matches!(
+                    pending_scale,
+                    Some(PendingScale::MergeDown {
+                        source_worker_id: pending_source,
+                        target_worker_id,
+                        waiting_for_target,
+                        ..
+                    }) if *pending_source == source_worker_id
+                        && *target_worker_id == worker_id
+                        && *waiting_for_target
+                ) {
+                    let _ = pending_scale.take();
+                    record_node_operation(controls, node_index, ScaleDirection::Merge);
+                    mark_node_settling(controls, node_index);
                 }
             }
             WorkerEvent::Failed {
@@ -4532,13 +5229,12 @@ fn drain_worker_events<E>(
                 remove_worker_from_node(active_by_node, node_index, worker_id);
                 workers[worker_id].active_node = None;
                 workers[worker_id].retire = None;
+                workers[worker_id].merge_pending = None;
+                workers[worker_id].merge_sender = None;
                 if !parked.contains(&worker_id) {
                     parked.push(worker_id);
                 }
-                if pending_scale
-                    .as_ref()
-                    .is_some_and(|pending| pending.worker_id == worker_id)
-                {
+                if pending_scale_involves_worker(pending_scale.as_ref(), worker_id) {
                     *pending_scale = None;
                 }
                 abort.store(true, Ordering::Release);
@@ -4546,11 +5242,36 @@ fn drain_worker_events<E>(
                     NodeFailure::Init(error) => PiperError::UserInit { worker, error },
                     NodeFailure::Process(error) => PiperError::UserProcess { worker, error },
                     NodeFailure::Cleanup(error) => PiperError::UserCleanup { worker, error },
+                    NodeFailure::Merge(error) => PiperError::UserMerge { worker, error },
                     NodeFailure::Internal(message) => PiperError::Internal { worker, message },
                 });
             }
             WorkerEvent::Stopped => {}
         }
+    }
+}
+
+fn mark_node_settling(controls: &mut [NodeControl], node_index: usize) {
+    controls[node_index].settling = true;
+    controls[node_index].settle_samples = 0;
+    controls[node_index].settle_observed_work = false;
+    controls[node_index].scaling_state = NodeScalingState::Settling;
+}
+
+fn pending_scale_involves_worker(pending: Option<&PendingScale>, worker_id: usize) -> bool {
+    match pending {
+        Some(PendingScale::Add {
+            worker_id: pending, ..
+        })
+        | Some(PendingScale::Remove {
+            worker_id: pending, ..
+        }) => *pending == worker_id,
+        Some(PendingScale::MergeDown {
+            source_worker_id,
+            target_worker_id,
+            ..
+        }) => *source_worker_id == worker_id || *target_worker_id == worker_id,
+        None => false,
     }
 }
 
@@ -4581,8 +5302,6 @@ const STABLE_RATE_RATIO: f64 = 0.12;
 const FAST_RATE_RATIO: f64 = 0.45;
 const RUNAWAY_RATE_RATIO: f64 = 0.85;
 const SETTLE_SAMPLES: u32 = 2;
-const PROBE_SETTLE_SAMPLES: u32 = 2;
-const IDLE_SHRINK_SAMPLES: u32 = 50;
 const DEFAULT_BACKLOG_DRAIN_SECS: f64 = 1.0;
 
 fn sample_links(links: &[Link], elapsed: Duration, controls: &mut [LinkControl]) {
@@ -4806,12 +5525,10 @@ fn update_desired_workers<E>(
 enum ScaleOperation {
     Add {
         node_index: usize,
-        reason: ScaleReason,
     },
     Remove {
         node_index: usize,
         worker_id: Option<usize>,
-        reason: ScaleReason,
     },
 }
 
@@ -4912,7 +5629,6 @@ where
         }
         return Some(ScaleOperation::Add {
             node_index,
-            reason: ScaleReason::Scalable,
         });
     }
 
@@ -5058,7 +5774,6 @@ where
                 return Some(ScaleOperation::Remove {
                     node_index,
                     worker_id: None,
-                    reason: ScaleReason::Scalable,
                 });
             }
             ResolvedThreadPolicy::ImplicitSupport => {
@@ -5073,7 +5788,6 @@ where
                 return Some(ScaleOperation::Remove {
                     node_index,
                     worker_id: None,
-                    reason: ScaleReason::Support,
                 });
             }
             ResolvedThreadPolicy::Fixed(_) => {}
@@ -5107,6 +5821,16 @@ fn node_can_scale(control: &NodeControl) -> bool {
         && !matches!(control.thread_policy, ResolvedThreadPolicy::Fixed(_))
         && !control.settling
         && control.scaling_state != NodeScalingState::Settling
+        && control.scaling_state != NodeScalingState::Merging
+}
+
+fn node_has_merge_state<E>(node: &RuntimeNode<E>) -> bool
+where
+    E: Debug + Display + Send + 'static,
+{
+    node.stage
+        .as_ref()
+        .is_some_and(|stage| stage.can_merge_state())
 }
 
 fn add_or_rebalance_for_node(
@@ -5118,7 +5842,6 @@ fn add_or_rebalance_for_node(
     if active_worker_count(active_by_node) < global_worker_cap {
         return Some(ScaleOperation::Add {
             node_index,
-            reason: ScaleReason::Support,
         });
     }
 
@@ -5136,7 +5859,6 @@ fn add_or_rebalance_for_node(
             return Some(ScaleOperation::Remove {
                 node_index: anchor_index,
                 worker_id: None,
-                reason: ScaleReason::BudgetPressure,
             });
         }
     }
@@ -5415,6 +6137,7 @@ mod tests {
                 weighted_branch_config: None,
                 is_external: false,
                 external_index: None,
+                return_state_on_exit: false,
             })
             .collect()
     }
@@ -5451,6 +6174,14 @@ mod tests {
             classify_queue_trend(2, 20, 10.0, 100.0, -90.0),
             QueueTrend::FastDraining
         );
+    }
+
+    #[test]
+    fn merging_state_blocks_more_scale_decisions() {
+        let mut control = scalable_control(4);
+        assert!(node_can_scale(&control));
+        control.scaling_state = NodeScalingState::Merging;
+        assert!(!node_can_scale(&control));
     }
 
     fn branch_controller(config: SingleThreadWeightedBranchConfig) -> WeightedBranchController {
@@ -5584,10 +6315,7 @@ mod tests {
 
         assert!(matches!(
             choose_scale_operation(&links, &active, &mut controls, &nodes, 2, 4),
-            Some(ScaleOperation::Add {
-                node_index: 1,
-                reason: ScaleReason::Support
-            })
+            Some(ScaleOperation::Add { node_index: 1 })
         ));
     }
 
@@ -5631,7 +6359,6 @@ mod tests {
             choose_scale_operation(&links, &active, &mut controls, &nodes, 2, 3),
             Some(ScaleOperation::Remove {
                 node_index: 0,
-                reason: ScaleReason::BudgetPressure,
                 ..
             })
         ));

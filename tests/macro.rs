@@ -82,3 +82,146 @@ fn pipeline_graph_type_mismatch_fails() {
     );
     assert!(stderr.contains("IntoNodeSpec"), "{stderr}");
 }
+
+#[test]
+fn state_pipeline_without_merge_has_no_join_merged() {
+    let source = r#"
+use piper::{Node, NodeContext, PiperConfig, node, pipeline};
+use std::time::Duration;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum MacroError {}
+
+struct Count;
+
+impl Node for Count {
+    type Input = u32;
+    type Output = u32;
+    type Error = MacroError;
+    type State = usize;
+
+    fn init(&self) -> std::result::Result<Self::State, Self::Error> {
+        Ok(0)
+    }
+
+    fn process(
+        &self,
+        state: &mut Self::State,
+        input: Self::Input,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
+    ) -> std::result::Result<(), Self::Error> {
+        *state += 1;
+        ctx.emit(input);
+        Ok(())
+    }
+}
+
+fn config() -> PiperConfig {
+    PiperConfig {
+        sample_interval: Duration::from_millis(1),
+        poll_interval: Duration::from_millis(1),
+        global_worker_cap: Some(2),
+        csv_telemetry: None,
+    }
+}
+
+pipeline! {
+    pub struct StatePipeline {
+        type Input = u32;
+        type Output = u32;
+        type Error = MacroError;
+
+        config = config();
+        nodes = [node("count", Count).fixed_threads(1)];
+        return_state = usize;
+    }
+}
+
+pub fn check() {
+    let run = StatePipeline::start().unwrap();
+    let _ = run.join_merged();
+}
+"#;
+    let dir = fixture_dir("no_join_merged");
+    write_manifest(&dir);
+    write_fixture(&dir, source);
+    let output = cargo_check_release(&dir);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("join_merged"), "{stderr}");
+}
+
+#[test]
+fn return_state_rejects_multiple_output_producers() {
+    let source = r#"
+use piper::{Node, NodeContext, PiperConfig, node, pipeline};
+use std::time::Duration;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum MacroError {}
+
+struct Pass;
+
+impl Node for Pass {
+    type Input = u32;
+    type Output = u32;
+    type Error = MacroError;
+    type State = usize;
+
+    fn init(&self) -> std::result::Result<Self::State, Self::Error> {
+        Ok(0)
+    }
+
+    fn process(
+        &self,
+        state: &mut Self::State,
+        input: Self::Input,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
+    ) -> std::result::Result<(), Self::Error> {
+        *state += 1;
+        ctx.emit(input);
+        Ok(())
+    }
+}
+
+fn config() -> PiperConfig {
+    PiperConfig {
+        sample_interval: Duration::from_millis(1),
+        poll_interval: Duration::from_millis(1),
+        global_worker_cap: Some(2),
+        csv_telemetry: None,
+    }
+}
+
+pipeline! {
+    pub struct BadStateGraph {
+        type Input = u32;
+        type Output = u32;
+        type Error = MacroError;
+
+        config = config();
+        nodes = {
+            left = node("left", Pass),
+            right = node("right", Pass),
+        };
+        graph = {
+            input -> [left, right];
+            [left, right] -> output;
+        };
+        return_state = usize;
+    }
+}
+"#;
+    let dir = fixture_dir("bad_state_graph");
+    write_manifest(&dir);
+    write_fixture(&dir, source);
+    let output = cargo_check_release(&dir);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("return_state requires exactly one managed node"),
+        "{stderr}"
+    );
+}

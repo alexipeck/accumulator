@@ -1,13 +1,14 @@
 use piper::{
     BufferLease, IntoNodeSpec, NodeThreadPolicyKind, PipelineGraph, PipelineGraphBuilder, Piper,
     PiperConfig, NodeScalePolicy, PiperError, SingleThreadWeightedBranchConfig, Node, NodeContext,
-    TelemetryLogConfig, anchor, inline_node, node, panic_payload_to_string, pipeline,
+    TelemetryLogConfig, anchor, inline_node, node, node_with_state_merge, panic_payload_to_string,
+    pipeline,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -147,6 +148,192 @@ where
     let input = builder.input();
     let output = builder.add_node(input, stage_like);
     builder.finish(output)
+}
+
+struct CountingFinal;
+
+impl Node for CountingFinal {
+    type Input = u32;
+    type Output = u32;
+    type Error = TestError;
+    type State = usize;
+
+    fn init(&self) -> std::result::Result<Self::State, Self::Error> {
+        Ok(0)
+    }
+
+    fn process(
+        &self,
+        state: &mut Self::State,
+        input: Self::Input,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
+    ) -> std::result::Result<(), Self::Error> {
+        *state += 1;
+        ctx.emit(input);
+        Ok(())
+    }
+}
+
+fn merge_usize(target: &mut usize, source: usize) -> std::result::Result<(), TestError> {
+    *target += source;
+    Ok(())
+}
+
+struct SlowCountingFinal {
+    processed: Arc<AtomicUsize>,
+}
+
+impl Node for SlowCountingFinal {
+    type Input = u32;
+    type Output = u32;
+    type Error = TestError;
+    type State = usize;
+
+    fn init(&self) -> std::result::Result<Self::State, Self::Error> {
+        Ok(0)
+    }
+
+    fn process(
+        &self,
+        state: &mut Self::State,
+        input: Self::Input,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
+    ) -> std::result::Result<(), Self::Error> {
+        std::thread::sleep(Duration::from_millis(2));
+        *state += 1;
+        self.processed.fetch_add(1, Ordering::Relaxed);
+        ctx.emit(input);
+        Ok(())
+    }
+}
+
+fn fast_scale_policy() -> NodeScalePolicy {
+    NodeScalePolicy {
+        initial_threads: 1,
+        max_threads: 4,
+        target_queue_seconds: 0.001,
+        low_queue_seconds: 0.001,
+        scale_down_after: Duration::from_millis(10),
+        underutilized_busy_ratio: 0.95,
+    }
+}
+
+#[test]
+fn state_returning_final_node_join_returns_worker_states() {
+    let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+    let input = builder.input();
+    let output = builder.add_node(input, node("count", CountingFinal).fixed_threads(2));
+    let piper = piper::PiperWithState::<u32, u32, usize, TestError>::start(
+        config(),
+        builder.finish_with_state::<u32, usize>(output),
+    )
+    .unwrap();
+
+    for value in 0..10 {
+        piper.sender().send(value).unwrap();
+    }
+    piper.shutdown();
+    for _ in 0..10 {
+        piper.receiver().recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    let states = piper.join().unwrap();
+    assert_eq!(states.iter().sum::<usize>(), 10);
+    assert_eq!(states.len(), 2);
+}
+
+#[test]
+fn state_returning_mergeable_final_node_join_merged_returns_one_state() {
+    let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+    let input = builder.input();
+    let output = builder.add_node(
+        input,
+        node_with_state_merge("count", CountingFinal, merge_usize).fixed_threads(2),
+    );
+    let piper = piper::PiperWithState::<u32, u32, usize, TestError, true>::start(
+        config(),
+        builder.finish_with_merged_state::<u32, usize>(output),
+    )
+    .unwrap();
+
+    for value in 0..12 {
+        piper.sender().send(value).unwrap();
+    }
+    piper.shutdown();
+    for _ in 0..12 {
+        piper.receiver().recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    assert_eq!(piper.join_merged().unwrap(), 12);
+}
+
+#[test]
+fn merge_scale_down_preserves_state_and_runs_on_target_worker() {
+    let processed = Arc::new(AtomicUsize::new(0));
+    let merges = Arc::new(AtomicUsize::new(0));
+    let merges_for_closure = Arc::clone(&merges);
+    let mut builder = PipelineGraphBuilder::<u32, TestError>::new();
+    let input = builder.input();
+    let output = builder.add_node(
+        input,
+        node_with_state_merge(
+            "count",
+            SlowCountingFinal {
+                processed: Arc::clone(&processed),
+            },
+            move |target: &mut usize, source: usize| {
+                merges_for_closure.fetch_add(1, Ordering::Relaxed);
+                *target += source;
+                Ok(())
+            },
+        )
+        .with_scale_policy(fast_scale_policy()),
+    );
+    let piper = piper::PiperWithState::<u32, u32, usize, TestError, true>::start(
+        config(),
+        builder.finish_with_merged_state::<u32, usize>(output),
+    )
+    .unwrap();
+    let receiver = piper.receiver();
+    let received = Arc::new(AtomicUsize::new(0));
+    let received_for_thread = Arc::clone(&received);
+    let drainer = std::thread::spawn(move || {
+        while received_for_thread.load(Ordering::Relaxed) < 160 {
+            if receiver.recv_timeout(Duration::from_secs(1)).is_ok() {
+                received_for_thread.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+
+    for value in 0..160 {
+        piper.sender().send(value).unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_scale_up = false;
+    while Instant::now() < deadline {
+        let active = piper.get_telemetry().nodes[0].active_threads;
+        saw_scale_up |= active > 1;
+        if saw_scale_up && received.load(Ordering::Relaxed) == 160 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(saw_scale_up, "node did not scale up before workload completed");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && merges.load(Ordering::Relaxed) == 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        merges.load(Ordering::Relaxed) > 0,
+        "node did not perform a merge-down"
+    );
+
+    piper.shutdown();
+    drainer.join().unwrap();
+    assert_eq!(piper.join_merged().unwrap(), 160);
+    assert_eq!(processed.load(Ordering::Relaxed), 160);
 }
 
 #[test]

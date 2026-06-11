@@ -10,6 +10,10 @@ Forks are MPMC work-sharing fan-out: each item emitted onto a forked link is con
 
 Dynamic pipelines can mark one or more heavy nodes with `anchor(...)`. Use `scalable_threads(initial, max)` for scalable anchors, `fixed_threads(n)` for fixed control points that the manager tunes around but never resizes, and `with_scale_policy(NodeScalePolicy { ... })` for finer queue and scaling thresholds. Piper scales scalable anchors up to their configured maximum and scales surrounding nodes to keep anchors fed and drained.
 
+Stateful nodes that need to preserve worker-local state across scale-down can be declared with `node_with_state_merge("name", node, merge_fn)`. The merge function combines a retiring worker's state into a still-active worker between input items. Scalable nodes without a merge function keep the existing behavior: a retired worker runs `cleanup(state)`, and that worker-local state is discarded unless user code saved it there.
+
+Pipelines can also opt into returning the final managed node's state on shutdown with `return_state = StateType;`. The final node still emits normal outputs. For non-mergeable final nodes, `join()` returns `Vec<StateType>`. For final nodes declared with `node_with_state_merge(...)`, `join()` returns the worker states and `join_merged()` returns one merged state.
+
 ## Fork/join graph pipeline
 
 Graph pipelines declare every node by name in `nodes = { ... }`, then wire them with `graph = { ... }` edges. The full runnable version lives in [examples/fork_join_pipeline.rs](examples/fork_join_pipeline.rs).

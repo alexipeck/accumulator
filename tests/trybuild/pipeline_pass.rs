@@ -1,4 +1,7 @@
-use piper::{BufferLease, PiperConfig, Node, NodeContext, anchor, inline_node, node, pipeline};
+use piper::{
+    BufferLease, PiperConfig, Node, NodeContext, anchor, inline_node, node,
+    node_with_state_merge, pipeline,
+};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -49,6 +52,35 @@ impl Node for Keep {
         ctx.emit(input);
         Ok(())
     }
+}
+
+struct CountingKeep;
+
+impl Node for CountingKeep {
+    type Input = u16;
+    type Output = u16;
+    type Error = MacroError;
+    type State = usize;
+
+    fn init(&self) -> std::result::Result<Self::State, Self::Error> {
+        Ok(0)
+    }
+
+    fn process(
+        &self,
+        state: &mut Self::State,
+        input: Self::Input,
+        ctx: &mut NodeContext<Self::Output, Self::Error>,
+    ) -> std::result::Result<(), Self::Error> {
+        *state += 1;
+        ctx.emit(input);
+        Ok(())
+    }
+}
+
+fn merge_usize(target: &mut usize, source: usize) -> std::result::Result<(), MacroError> {
+    *target += source;
+    Ok(())
 }
 
 fn config() -> PiperConfig {
@@ -125,6 +157,33 @@ pipeline! {
 }
 
 pipeline! {
+    pub struct StatePipeline {
+        type Input = u8;
+        type Output = u16;
+        type Error = MacroError;
+
+        config = config();
+        nodes = [Widen, node("count", CountingKeep).fixed_threads(1)];
+        return_state = usize;
+    }
+}
+
+pipeline! {
+    pub struct MergedStatePipeline {
+        type Input = u8;
+        type Output = u16;
+        type Error = MacroError;
+
+        config = config();
+        nodes = [
+            Widen,
+            node_with_state_merge("count", CountingKeep, merge_usize).fixed_threads(1),
+        ];
+        return_state = usize;
+    }
+}
+
+pipeline! {
     pub struct ExternalPipeline {
         type Input = u8;
         type Output = BufferLease<Vec<u16>>;
@@ -158,6 +217,8 @@ fn main() {
     let _ = NamedPipeline::start;
     let _ = InlinePipeline::start;
     let _ = GraphPipeline::start;
+    let _ = StatePipeline::start;
+    let _ = MergedStatePipeline::start;
     let _ = ExternalPipeline::start;
     let _ = external_run_shape;
 }
