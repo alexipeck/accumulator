@@ -81,6 +81,12 @@ cargo run --release --example fork_join_pipeline
 
 See [examples/fork_join_pipeline.rs](examples/fork_join_pipeline.rs) for `Node` implementations, buffer leases, telemetry, and concurrent output draining. For linear `nodes = [ ... ]` sugar without a graph, see [examples/pipeline_api_styles.rs](examples/pipeline_api_styles.rs).
 
+For a stateful accumulator that auto-scales, merges worker-local state during scale-down, and returns the final merged state from `join_merged()`, run:
+
+```bash
+cargo run --release --example accumulator_scaling
+```
+
 ## Feeder MPMC links
 
 With the `feeder` feature enabled, `PipelineGraphBuilder::feeder_link(...)` can mark any graph link as a feeder-backed MPMC queue, including links adjacent to external nodes and the public pipeline `input` / `output` endpoints. See [examples/scaling_pipeline_feeder.rs](examples/scaling_pipeline_feeder.rs) and [examples/fork_join_feeder.rs](examples/fork_join_feeder.rs).
